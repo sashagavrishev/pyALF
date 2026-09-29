@@ -1905,9 +1905,7 @@ _process_pool_lock = threading.Lock()
 def _process_pool_size() -> int:
     """Worker count for the h5py read pool, capped to any SLURM allocation.
 
-    Mirrors ``scripts.common.pool_workers``'s reasoning without importing it
-    (this module sits below ``scripts/`` in the dependency direction): a bare
-    process count defaults to the whole node's cores, not the cgroup a SLURM
+    A bare process count defaults to the whole node's cores, not the cgroup a SLURM
     task was actually granted, and a status check run as its own job (e.g.
     ``reconcile`` on a timer) must not oversubscribe that allocation the way
     a handful of extra processes importing h5py/numpy each could.
@@ -1964,8 +1962,7 @@ def _read_bin_count(
     for attempt in range(len(_H5_RETRY_DELAYS) + 1):
         try:
             # POSIX file locking stalls (or errors) on networked filesystems, and
-            # a read-only probe gets nothing from it -- see the same reasoning
-            # in scripts/slurm/analysis_map.sbatch's HDF5_USE_FILE_LOCKING=FALSE.
+            # a read-only probe gets nothing from it.
             with h5py.File(filename, "r", locking=False) as f:
                 if counting_obs in f:
                     N_bins = f[counting_obs + "/obser"].shape[0]

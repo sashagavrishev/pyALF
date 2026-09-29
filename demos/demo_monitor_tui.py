@@ -15,11 +15,11 @@ Demo modes
                     SimulationMonitor.from_session(), exercising the same
                     code path used after a real SubmissionReview run
   2  parallel params — a single PARALLEL_PARAMS job (one SLURM id) is expanded
-                       into one row per Temp_i disorder realisation, each with
+                       into one row per Temp_i parameter set, each with
                        its own bin progress.  Tagged PP[i] and flagged in the
                        title bar so it is not mistaken for a SLURM array.  One
                        job is RUNNING (live per-config bars) and one COMPLETED
-                       (press 'i' to see each realisation's distinct seed).
+                       (press 'i' to see each rank's distinct seed).
 
 All SLURM queries, bin counts, and cluster operations are mocked so no
 cluster connection is needed.
@@ -179,13 +179,13 @@ def _fake_info(ham: str, beta: float, L: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# PARALLEL_PARAMS workspace (mode 2): one job, many Temp_i realisations
+# PARALLEL_PARAMS workspace (mode 2): one job, many Temp_i parameter sets
 # ---------------------------------------------------------------------------
 
-# ham,                    sigma, job_id,  status,      runtime,   NBin, bins per realisation
+# ham,      U,    job_id,  status,      runtime,   NBin, bins per Temp_i
 _PP_JOBS: list[tuple[str, float, str, str, str | None, int, list[int]]] = [
     (
-        "Hubbard_PV_Disorder",
+        "Hubbard",
         0.5,
         "55123",
         "RUNNING",
@@ -194,7 +194,7 @@ _PP_JOBS: list[tuple[str, float, str, str, str | None, int, list[int]]] = [
         [22, 18, 25, 30, 15, 28],
     ),
     (
-        "Hubbard_PV_Disorder",
+        "Hubbard",
         1.0,
         "55124",
         "COMPLETED",
@@ -209,7 +209,7 @@ def _setup_parallel_params_workspace() -> tuple[list, dict, dict]:
     """One SLURM job per entry, each prepared with len(bins) Temp_i/ dirs.
 
     Mirrors a real PARALLEL_PARAMS submission: a single job id, one MPI rank per
-    disorder realisation writing into Temp_i/.  The monitor expands each job into
+    parameter set writing into Temp_i/.  The monitor expands each job into
     one row per Temp_i.
     """
     from types import SimpleNamespace
@@ -218,9 +218,9 @@ def _setup_parallel_params_workspace() -> tuple[list, dict, dict]:
     statuses: dict[str, dict] = {}
     bin_map: dict[str, int] = {}
 
-    for ham, sigma, jid, status, runtime, nbin, bins in _PP_JOBS:
+    for ham, U, jid, status, runtime, nbin, bins in _PP_JOBS:
         n_real = len(bins)
-        sim_dir = _TMPDIR / "ALF_data" / f"{ham}_sigma={sigma}"
+        sim_dir = _TMPDIR / "ALF_data" / f"{ham}_U={U}"
         sim_dir.mkdir(parents=True, exist_ok=True)
         (sim_dir / "jobid.txt").write_text(jid)
 
@@ -228,16 +228,16 @@ def _setup_parallel_params_workspace() -> tuple[list, dict, dict]:
         statuses[jid] = {"status": status, "runtime": runtime, "nodelist": nodelist}
         if status in ("RUNNING", "COMPLETED"):
             log = _SUBMIT_DIR / f"{jid}_0_log.out"
-            log.write_text(_fake_pp_log(jid, ham, sigma, status, n_real))
+            log.write_text(_fake_pp_log(jid, ham, U, status, n_real))
 
         for i, n_bins in enumerate(bins):
             temp = sim_dir / f"Temp_{i}"
             temp.mkdir(parents=True, exist_ok=True)
             bin_map[str(temp)] = n_bins
-            # Per-realisation info shows the distinct seed (base + igroup); only
+            # Per-rank info shows the distinct seed (base + igroup); only
             # meaningful once COMPLETED, when 'i' is enabled in the TUI.
             if status == "COMPLETED":
-                (temp / "info").write_text(_fake_pp_info(ham, sigma, seed=i))
+                (temp / "info").write_text(_fake_pp_info(ham, U, seed=i))
 
         sims.append(
             SimpleNamespace(
@@ -249,7 +249,7 @@ def _setup_parallel_params_workspace() -> tuple[list, dict, dict]:
                         "L1": 8,
                         "L2": 8,
                         "NBin": nbin,
-                        "Ham_chem_disorder_std": sigma,
+                        "Ham_U": U,
                         "mpi_per_parameter_set": 1,
                     }
                 ]
@@ -266,24 +266,23 @@ def _setup_parallel_params_workspace() -> tuple[list, dict, dict]:
     return sims, statuses, bin_map
 
 
-def _fake_pp_log(jid: str, ham: str, sigma: float, status: str, n_real: int) -> str:
+def _fake_pp_log(jid: str, ham: str, U: float, status: str, n_real: int) -> str:
     lines = [
-        f"[ALF] job {jid}  PARALLEL_PARAMS  ham={ham}  sigma={sigma}",
-        f"[ALF] {n_real} disorder realisations, one MPI rank each "
+        f"[ALF] job {jid}  PARALLEL_PARAMS  ham={ham}  U={U}",
+        f"[ALF] {n_real} parameter sets, one MPI rank each "
         f"→ Temp_0 … Temp_{n_real - 1}",
-        "[ALF] Each rank seeded ham_disorder_seed + igroup before drawing disorder.",
     ]
     lines += [
-        "[ALF] All realisations done." if status == "COMPLETED" else "[ALF] Running…"
+        "[ALF] All parameter sets done." if status == "COMPLETED" else "[ALF] Running…"
     ]
     return "\n".join(lines) + "\n"
 
 
-def _fake_pp_info(ham: str, sigma: float, seed: int) -> str:
+def _fake_pp_info(ham: str, U: float, seed: int) -> str:
     return (
         f"Model is                   : {ham}\n"
-        f"Ham_chem_disorder_std      : {sigma}\n"
-        f"Disorder seed (base+igroup): {seed}\n"
+        f"Ham_U                      : {U}\n"
+        f"Seed (base+igroup)         : {seed}\n"
         f"Beta                       : 5.0\n"
         f"L1 / L2                    : 8 / 8\n"
         f"Status                     : COMPLETED\n"
@@ -369,7 +368,7 @@ def _write_demo_session(sims: list, statuses: dict) -> Path:
 MODES = {
     "fresh sims (direct SimulationMonitor)": "fresh",
     "from session manifest (SimulationMonitor.from_session)": "session",
-    "PARALLEL_PARAMS expansion (one row per Temp_i realisation)": "parallel_params",
+    "PARALLEL_PARAMS expansion (one row per Temp_i)": "parallel_params",
 }
 
 
