@@ -1563,6 +1563,18 @@ def test_exec_alf_binary_preserves_data_on_checkpoint_restart(tmp_path):
     assert data.read_bytes() == b"accumulated"
 
 
+def test_exec_alf_binary_passes_extra_env(tmp_path):
+    """A Simulation's env reaches the ALF process."""
+    (tmp_path / "ALF.out").touch()
+
+    with patch("subprocess.run") as run:
+        _exec_alf_binary(
+            tmp_path, n_omp=1, n_mpi=1, mpi=False, extra_env={"ALF_DELAY_K": "32"}
+        )
+
+    assert run.call_args.kwargs["env"]["ALF_DELAY_K"] == "32"
+
+
 def test_exec_alf_binary_no_backup_when_no_data(tmp_path):
     """No error and no backup file when data.h5 does not exist."""
     binary = tmp_path / "ALF.out"

@@ -202,6 +202,7 @@ def run_segment(sim) -> None:
         mpiexec_args=getattr(sim, "mpiexec_args", []),
         config=getattr(sim, "config", ""),
         alf_dir=getattr(sim.alf_src, "alf_dir", "."),
+        extra_env=getattr(sim, "env", None),
     )
     elapsed = time.time() - started
 

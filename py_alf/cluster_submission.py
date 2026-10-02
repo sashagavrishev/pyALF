@@ -446,6 +446,7 @@ def _exec_alf_binary(
     mpiexec_args: list[str] | None = None,
     config: str = "",
     alf_dir: str = ".",
+    extra_env: dict[str, str] | None = None,
 ) -> None:
     """Execute the ALF binary already present in *sim_dir*.
 
@@ -461,6 +462,7 @@ def _exec_alf_binary(
     # Prefer SLURM_CPUS_PER_TASK so OMP_NUM_THREADS exactly matches the
     # allocated CPU slots, which is best practice for hybrid MPI+OpenMP jobs.
     env["OMP_NUM_THREADS"] = os.environ.get("SLURM_CPUS_PER_TASK", str(n_omp))
+    env.update(extra_env or {})
 
     # Guard against overwriting data from a previous independent run.
     # When confin_* files are present ALF will checkpoint-restart and
@@ -506,6 +508,7 @@ def _run_alf(sim: Simulation) -> None:
         mpiexec_args=getattr(sim, "mpiexec_args", []),
         config=getattr(sim, "config", ""),
         alf_dir=getattr(sim.alf_src, "alf_dir", "."),
+        extra_env=getattr(sim, "env", None),
     )
 
 

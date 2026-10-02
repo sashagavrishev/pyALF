@@ -87,6 +87,8 @@ class Simulation:
     hdf5 : bool, default=True
         Whether to compile ALF with HDF5.
         Full postprocessing support only exists with HDF5.
+    env : dict of str, optional
+        Extra environment variables for the ALF process (e.g. ``ALF_DELAY_K``).
 
     """
 
@@ -132,6 +134,7 @@ class Simulation:
         machine = kwargs.pop("machine", "GNU").upper()
         self.devel = kwargs.pop("devel", False)
         self.hdf5 = kwargs.pop("hdf5", True)
+        self.env = dict(kwargs.pop("env", None) or {})
         if kwargs:
             raise TypeError(f"Unused keyword arguments: {kwargs}")
 
