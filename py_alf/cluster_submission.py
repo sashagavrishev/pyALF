@@ -984,9 +984,11 @@ class ClusterSubmitter:
                         f"n_omp={s.n_omp}, n_mpi={s.n_mpi}, mpi={s.mpi}."
                     )
 
-        _raw_slurm_time = (self.slurm_kwargs or {}).get("slurm_time")
+        # Same precedence as the params merge below, so the partition is chosen
+        # for the wall time actually requested.
+        _raw_slurm_time = (job_properties or {}).get("slurm_time")
         if _raw_slurm_time is None:
-            _raw_slurm_time = (job_properties or {}).get("slurm_time")
+            _raw_slurm_time = (self.slurm_kwargs or {}).get("slurm_time")
         if _raw_slurm_time is not None:
             timeout_hours = _slurm_time_to_minutes(_raw_slurm_time) / 60
         else:
@@ -1028,7 +1030,7 @@ class ClusterSubmitter:
         if self.executor == "slurm":
             params["slurm_mem"] = self.slurm_mem
             params["slurm_partition"] = self._select_partition(timeout_hours)
-            self._check_node_fit(sim, params["slurm_partition"])  # ← add this line
+            self._check_node_fit(sim, params["slurm_partition"])
             if self.mail_type is not None:
                 params["slurm_mail_type"] = self.mail_type
             if self.wckey is not None:

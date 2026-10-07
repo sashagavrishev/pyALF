@@ -332,6 +332,28 @@ def test_submit_auto_selects_long_partition(tmp_path):
     assert call_kwargs["slurm_partition"] == "long"
 
 
+def test_submit_job_properties_slurm_time_selects_partition(tmp_path):
+    """A per-call slurm_time beats the instance one for partition and --time alike."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    sim.sim_dict = {"CPU_MAX": 2}
+
+    mock_job = MagicMock()
+    mock_job.job_id = "3"
+
+    with _patch_submitit(mock_job) as mock_executor:
+        cs = ClusterSubmitter(
+            submit_dir=tmp_path / "logs",
+            slurm_mem="4G",
+            partition_rules={"short": 8, "long": 168},
+            slurm_time=60,
+        )
+        cs.submit(sim, job_properties={"slurm_time": "24:00:00"})
+
+    call_kwargs = mock_executor.return_value.update_parameters.call_args.kwargs
+    assert call_kwargs["slurm_partition"] == "long"
+    assert call_kwargs["slurm_time"] == 24 * 60
+
+
 def test_submit_job_name_overrides_ham_name(tmp_path):
     """Explicit job_name takes precedence over sim.ham_name."""
     sim = _make_mock_sim(tmp_path / "sim0")
