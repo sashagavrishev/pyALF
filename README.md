@@ -28,7 +28,7 @@ jobs = cs.submit(sims)             # one SLURM array for several sims
 ```
 
 - **Partitions:** each `partition_rules` value is hours, or a `PartitionSpec` with `max_hours` and optional `max_cpus` / `max_mem_gb` limits that the submitter enforces.
-- **Wall time:** `slurm_time` if given (per call, then per instance), else `CPU_MAX` plus 10% so ALF can finish its last bin, capped at the limit of the smallest partition that fits `CPU_MAX`.
+- **Wall time:** `CPU_MAX` plus 10% so ALF can finish its last bin, capped at the limit of the smallest partition that fits `CPU_MAX`.
 - **Filtering:** sims whose `jobid.txt` names an active job are skipped (`skip_active=False` to trust the caller), as are those with a leftover `RUNNING` file (`stale_running="remove"` clears it).
 - **Other options:** `runner=` replaces what runs on the node, `prep=False` leaves directory preparation to it, and `max_requeues=` sets submitit's requeue budget.
 - **Files:** submitit's scripts, pickles and logs go to `submit_dir`, by default `.pyalf/` at the project root. A per-call `submit_dir` may contain submitit's `%A` / `%j` placeholders.

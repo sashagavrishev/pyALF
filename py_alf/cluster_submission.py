@@ -97,41 +97,6 @@ def _normalise_partition_spec(
     return PartitionSpec(**d)
 
 
-def _parse_slurm_time_hours(time_str: str) -> float | None:
-    """Parse a SLURM time-limit string into fractional hours.
-
-    Accepted formats (case-insensitive):
-
-    * ``UNLIMITED`` / ``INFINITE`` / ``NOT_SET`` → *None*
-    * ``MM``
-    * ``MM:SS``
-    * ``HH:MM:SS``
-    * ``D-HH:MM:SS``
-
-    Returns *None* for unlimited or unparseable values.
-    """
-    s = time_str.strip()
-    if not s or s.upper() in ("UNLIMITED", "INFINITE", "NOT_SET"):
-        return None
-    try:
-        days = 0
-        if "-" in s:
-            day_part, s = s.split("-", 1)
-            days = int(day_part)
-        parts = s.split(":")
-        if len(parts) == 3:
-            h, m, sec = int(parts[0]), int(parts[1]), int(parts[2])
-        elif len(parts) == 2:
-            h, m, sec = 0, int(parts[0]), int(parts[1])
-        elif len(parts) == 1:
-            h, m, sec = 0, 0, int(parts[0])
-        else:
-            return None
-        return days * 24 + h + m / 60 + sec / 3600
-    except (ValueError, IndexError):
-        return None
-
-
 def _project_root() -> Path:
     """Nearest ancestor of the CWD holding ``.git`` or a project file, else the CWD.
 
@@ -156,23 +121,6 @@ def _format_hours(h: float) -> str:
         return f"{h:g}h"
     days = h / 24
     return f"{int(days)}d" if days == int(days) else f"{days:.1f}d"
-
-
-def _slurm_time_to_minutes(value: int | str) -> int:
-    """Normalise a slurm_time value to integer minutes.
-
-    Accepts an integer (already in minutes) or an HH:MM:SS / D-HH:MM:SS string.
-    Raises ValueError for unrecognised strings.
-    """
-    if isinstance(value, int):
-        return value
-    hours = _parse_slurm_time_hours(value)
-    if hours is None:
-        raise ValueError(
-            f"Cannot parse slurm_time {value!r} — expected an integer (minutes) "
-            "or a string in HH:MM:SS / D-HH:MM:SS format."
-        )
-    return int(hours * 60)
 
 
 class ClusterSubmitter:
@@ -278,30 +226,22 @@ class ClusterSubmitter:
             f"Configured: {{{configured}}}"
         )
 
-    def _wall_time(
-        self, sim: Simulation, slurm_time: int | str | None
-    ) -> tuple[int, str | None]:
+    def _wall_time(self, sim: Simulation) -> tuple[int, str | None]:
         """``(minutes, partition)`` for *sim*; the partition is None off SLURM.
 
-        An explicit *slurm_time* is used as given. Otherwise the job asks for
-        ``CPU_MAX`` plus 10%, so ALF can finish its last bin and write its output
-        after stopping, capped at the limit of the partition ``CPU_MAX`` fits.
+        The job asks for ``CPU_MAX`` plus 10%, so ALF can finish its last bin
+        and write its output after stopping, capped at the limit of the
+        partition ``CPU_MAX`` fits.
         """
         slurm = self.executor == "slurm"
-        if slurm_time is not None:
-            minutes = _slurm_time_to_minutes(slurm_time)
-            return minutes, self._select_partition(minutes / 60) if slurm else None
-
         sim_dict = sim.sim_dict[0] if isinstance(sim.sim_dict, list) else sim.sim_dict
         cpu_max = float(sim_dict.get("CPU_MAX", 0))
         if not slurm:
             return int(max(cpu_max, 0.0) * 60), None
         if cpu_max <= 0:
             raise ValueError(
-                "CPU_MAX=0 means ALF stops after Nbin bins with no internal "
-                "time limit, so a SLURM wall time cannot be derived automatically. "
-                "Pass slurm_time (int minutes or HH:MM:SS) to ClusterSubmitter "
-                "or job_properties."
+                "CPU_MAX=0 gives ALF no time limit, so no SLURM wall time can be "
+                "derived; set CPU_MAX."
             )
         partition = self._select_partition(cpu_max)
         hours = min(cpu_max * 1.1, float(self.partition_rules[partition]["max_hours"]))
@@ -375,8 +315,7 @@ class ClusterSubmitter:
 
         Simulations with an active job or a leftover ``RUNNING`` are left out.
         Each submitted job's id is written to ``jobid.txt`` in its ``sim_dir``.
-        The wall time is ``slurm_time`` if given (per call, then per instance),
-        else ``CPU_MAX`` plus 10% capped at the partition limit.
+        The wall time is ``CPU_MAX`` plus 10%, capped at the partition limit.
 
         Parameters
         ----------
@@ -473,10 +412,7 @@ class ClusterSubmitter:
                         f"n_omp={s.n_omp}, n_mpi={s.n_mpi}, mpi={s.mpi}."
                     )
 
-        slurm_time = (job_properties or {}).get(
-            "slurm_time", self.executor_params.get("slurm_time")
-        )
-        timeout_min, partition = self._wall_time(sim, slurm_time)
+        timeout_min, partition = self._wall_time(sim)
 
         # Defaults, then the instance's options, then this call's. Each MPI rank
         # is a task slot of n_omp cores, matching mpiexec -n n_mpi with
@@ -499,8 +435,6 @@ class ClusterSubmitter:
                 params["slurm_use_srun"] = False
         params.update(self.executor_params)
         params.update(job_properties or {})
-        # Already folded into timeout_min.
-        params.pop("slurm_time", None)
 
         for s in filtered_sims:
             if prep:

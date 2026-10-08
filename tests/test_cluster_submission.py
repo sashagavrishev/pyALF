@@ -11,7 +11,6 @@ from py_alf.cluster_submission import (
     ClusterSubmitter,
     _normalise_partition_spec,
     _parse_mem_gb,
-    _parse_slurm_time_hours,
 )
 from py_alf.execute import exec_alf_binary
 from py_alf.simulation import Simulation
@@ -350,24 +349,18 @@ def test_submit_auto_selects_long_partition(tmp_path):
     assert call_kwargs["slurm_partition"] == "long"
 
 
-def test_submit_job_properties_slurm_time_selects_partition(tmp_path):
-    """A per-call slurm_time beats the instance one for partition and wall time."""
+def test_submit_without_cpu_max_needs_one_on_slurm(tmp_path):
+    """With no CPU_MAX there is no wall time to derive."""
     sim = _make_mock_sim(tmp_path / "sim0")
-    sim.sim_dict = {"CPU_MAX": 2}
-
-    with _patch_submitit(MagicMock(job_id="3")) as mock_executor:
-        cs = ClusterSubmitter(
-            submit_dir=tmp_path / "logs",
-            slurm_mem="4G",
-            partition_rules={"short": 8, "long": 168},
-            slurm_time=60,
-        )
-        cs.submit(sim, job_properties={"slurm_time": "24:00:00"})
-
-    call_kwargs = mock_executor.return_value.update_parameters.call_args.kwargs
-    assert call_kwargs["slurm_partition"] == "long"
-    assert call_kwargs["timeout_min"] == 24 * 60
-    assert "slurm_time" not in call_kwargs
+    sim.sim_dict = {"CPU_MAX": 0}
+    cs = ClusterSubmitter(
+        submit_dir=tmp_path / "logs", slurm_mem="2G", partition_rules=_RULES
+    )
+    with (
+        _patch_submitit(MagicMock(job_id="1")),
+        pytest.raises(ValueError, match="set CPU_MAX"),
+    ):
+        cs.submit(sim)
 
 
 def test_submit_wall_time_is_cpu_max_plus_ten_percent(tmp_path):
@@ -864,35 +857,6 @@ def test_submit_non_mpi_sim_has_no_use_srun(tmp_path):
     call_kwargs = mock_executor.return_value.update_parameters.call_args.kwargs
     assert "use_srun" not in call_kwargs
     assert "slurm_use_srun" not in call_kwargs
-
-
-# --- _parse_slurm_time_hours ---
-
-
-@pytest.mark.parametrize(
-    "s,expected",
-    [
-        ("2:00:00", 2.0),
-        ("00:30:00", 0.5),
-        ("1-00:00:00", 24.0),
-        ("14-00:00:00", 336.0),
-        ("2-12:00:00", 60.0),
-        ("00:10:00", 1 / 6),
-        ("30:00", 0.5),  # MM:SS form
-        ("120", 2.0 / 60),  # seconds-only form
-        ("UNLIMITED", None),
-        ("unlimited", None),
-        ("INFINITE", None),
-        ("NOT_SET", None),
-        ("", None),
-    ],
-)
-def test_parse_slurm_time_hours(s, expected):
-    result = _parse_slurm_time_hours(s)
-    if expected is None:
-        assert result is None
-    else:
-        assert result == pytest.approx(expected, rel=1e-6)
 
 
 # --- submit_dir resolution ---
