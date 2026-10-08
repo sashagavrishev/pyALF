@@ -37,7 +37,6 @@ def _clear_module_caches():
         _cs._bin_stat,
         _cs._bin_read_failures,
         _cs._submitit_timeout_cache,
-        _cs._jobid_cache,
     ):
         cache.clear()
     _cs._bin_final.clear()
@@ -1186,42 +1185,6 @@ def test_terminal_cache_still_queries_unfinished_jobs():
     assert j_arg == ["99201"], "cached terminal job must be excluded from the query"
     assert result["99200"]["status"] == "COMPLETED"
     assert result["99201"]["status"] == "RUNNING"
-
-
-# --- get_job_id ---
-
-
-def test_get_job_id_reads_and_caches(tmp_path):
-    from py_alf.cluster_submission import get_job_id
-
-    sim = _bin_count_sim(tmp_path)
-    (tmp_path / "jobid.txt").write_text("4242\n")
-    _settle(tmp_path / "jobid.txt")
-    assert get_job_id(sim) == "4242"
-
-    with patch.object(Path, "read_text", side_effect=AssertionError("re-read")):
-        assert get_job_id(sim) == "4242"
-
-
-def test_get_job_id_sees_a_resubmission(tmp_path):
-    """A resubmission rewrites jobid.txt; the new ID must not be masked."""
-    from py_alf.cluster_submission import get_job_id
-
-    sim = _bin_count_sim(tmp_path)
-    f = tmp_path / "jobid.txt"
-    f.write_text("4242")
-    _settle(f)
-    assert get_job_id(sim) == "4242"
-
-    f.write_text("9999")
-    _settle(f)
-    assert get_job_id(sim) == "9999"
-
-
-def test_get_job_id_missing_file(tmp_path):
-    from py_alf.cluster_submission import get_job_id
-
-    assert get_job_id(_bin_count_sim(tmp_path)) is None
 
 
 # --- _is_submitit_timeout ---

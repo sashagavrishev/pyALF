@@ -35,11 +35,7 @@ dependencies = [
   "numpy",
   "pandas",
   "scipy",
-  "colorama",
-  "Jinja2",
   "submitit",
-  "tabulate2",
-  "tqdm",
 ]
 
 [project.optional-dependencies]
