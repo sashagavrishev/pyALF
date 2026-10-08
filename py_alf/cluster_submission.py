@@ -242,24 +242,11 @@ class ClusterSubmitter:
         debug-partition jobs explicitly via ``job_properties``.
 
     job_name : str, optional
-        SLURM job name (``--job-name``). Defaults to the hamiltonian name.
-        Accepted for all executors.
-    mail_type : str, optional
-        SLURM mail event type, e.g. ``'END'``, ``'FAIL'``, ``'ALL'``.
-        Only valid when *executor* is ``'slurm'``.
-    wckey : str, optional
-        SLURM workload-characterisation key (``--wckey``).
-        Only valid when *executor* is ``'slurm'``.
-    stderr_to_stdout : bool
-        Redirect stderr to the stdout log file. Accepted for all executors.
-    **slurm_kwargs
-        Additional keyword arguments forwarded to
-        ``executor.update_parameters()``. Keys prefixed with ``slurm_``
-        are sent as raw ``#SBATCH`` directives. Only valid when *executor*
-        is ``'slurm'``. ``slurm_max_num_timeout`` is the exception: it is
-        a submitit executor setting (how many times a timed-out task may be
-        requeued, default 3) and is forwarded to the executor's constructor
-        instead.
+        Job name. Defaults to the Hamiltonian name.
+    **executor_params
+        Forwarded to submitit's ``update_parameters()``, e.g.
+        ``slurm_mail_type='FAIL'``, ``slurm_wckey=...``, ``slurm_setup=[...]``
+        or ``stderr_to_stdout=True``. ``slurm_*`` keys need the SLURM executor.
 
     Raises
     ------
@@ -279,10 +266,7 @@ class ClusterSubmitter:
         slurm_mem: str | None = None,
         partition_rules: dict[str, Any] | None = None,
         job_name: str | None = None,
-        mail_type: str | None = None,
-        wckey: str | None = None,
-        stderr_to_stdout: bool = False,
-        **slurm_kwargs,
+        **executor_params,
     ):
         if executor not in self._VALID_EXECUTORS:
             raise ValueError(
@@ -290,12 +274,10 @@ class ClusterSubmitter:
             )
 
         if executor != "slurm":
-            slurm_specific = [k for k in slurm_kwargs if k.startswith("slurm_")]
+            slurm_specific = [k for k in executor_params if k.startswith("slurm_")]
             problems = (
                 (["slurm_mem"] if slurm_mem is not None else [])
                 + (["partition_rules"] if partition_rules is not None else [])
-                + (["mail_type"] if mail_type is not None else [])
-                + (["wckey"] if wckey is not None else [])
                 + slurm_specific
             )
             if problems:
@@ -329,10 +311,7 @@ class ClusterSubmitter:
         self.slurm_mem = slurm_mem
         self.partition_rules: dict[str, PartitionSpec] | None = partition_rules
         self.job_name = job_name
-        self.mail_type = mail_type
-        self.wckey = wckey
-        self.stderr_to_stdout = stderr_to_stdout
-        self.slurm_kwargs = slurm_kwargs
+        self.executor_params = executor_params
 
     def _select_partition(self, timeout_hours: float) -> str:
         """Select the smallest-limit partition that accommodates *timeout_hours*."""
@@ -350,6 +329,35 @@ class ClusterSubmitter:
             f"Extend partition_rules or reduce CPU_MAX. "
             f"Configured: {{{configured}}}"
         )
+
+    def _wall_time(
+        self, sim: Simulation, slurm_time: int | str | None
+    ) -> tuple[int, str | None]:
+        """``(minutes, partition)`` for *sim*; the partition is None off SLURM.
+
+        An explicit *slurm_time* is used as given. Otherwise the job asks for
+        ``CPU_MAX`` plus 10%, so ALF can finish its last bin and write its output
+        after stopping, capped at the limit of the partition ``CPU_MAX`` fits.
+        """
+        slurm = self.executor == "slurm"
+        if slurm_time is not None:
+            minutes = _slurm_time_to_minutes(slurm_time)
+            return minutes, self._select_partition(minutes / 60) if slurm else None
+
+        sim_dict = sim.sim_dict[0] if isinstance(sim.sim_dict, list) else sim.sim_dict
+        cpu_max = float(sim_dict.get("CPU_MAX", 0))
+        if not slurm:
+            return int(max(cpu_max, 0.0) * 60), None
+        if cpu_max <= 0:
+            raise ValueError(
+                "CPU_MAX=0 means ALF stops after Nbin bins with no internal "
+                "time limit, so a SLURM wall time cannot be derived automatically. "
+                "Pass slurm_time (int minutes or HH:MM:SS) to ClusterSubmitter "
+                "or job_properties."
+            )
+        partition = self._select_partition(cpu_max)
+        hours = min(cpu_max * 1.1, float(self.partition_rules[partition]["max_hours"]))
+        return int(hours * 60), partition
 
     def _check_node_fit(
         self,
@@ -432,6 +440,7 @@ class ClusterSubmitter:
         prep: bool = True,
         stale_running: Literal["remove", "skip"] = "skip",
         skip_active: bool = True,
+        max_requeues: int | None = None,
     ) -> list[submitit.Job]:
         """
         Submit one or more Simulation instances to the SLURM cluster.
@@ -472,6 +481,9 @@ class ClusterSubmitter:
         skip_active : bool, default=True
             Leave out simulations whose ``jobid.txt`` names a job SLURM still
             holds. A caller that has already established this passes ``False``.
+        max_requeues : int, optional
+            How many times submitit may requeue a task that hit its wall time
+            (SLURM only; submitit's default is 3).
 
         Returns
         -------
@@ -540,26 +552,12 @@ class ClusterSubmitter:
                         f"n_omp={s.n_omp}, n_mpi={s.n_mpi}, mpi={s.mpi}."
                     )
 
-        # Same precedence as the params merge below, so the partition is chosen
-        # for the wall time actually requested.
-        _raw_slurm_time = (job_properties or {}).get("slurm_time")
-        if _raw_slurm_time is None:
-            _raw_slurm_time = (self.slurm_kwargs or {}).get("slurm_time")
-        if _raw_slurm_time is not None:
-            timeout_hours = _slurm_time_to_minutes(_raw_slurm_time) / 60
-        else:
-            _sim_dict0 = (
-                sim.sim_dict[0] if isinstance(sim.sim_dict, list) else sim.sim_dict
-            )
-            cpu_max = float(_sim_dict0.get("CPU_MAX", 0))
-            if cpu_max <= 0 and self.executor == "slurm":
-                raise ValueError(
-                    "CPU_MAX=0 means ALF stops after Nbin bins with no internal "
-                    "time limit, so a SLURM wall time cannot be derived automatically. "
-                    "Pass slurm_time (int minutes or HH:MM:SS) to ClusterSubmitter "
-                    "or job_properties."
-                )
-            timeout_hours = cpu_max if cpu_max > 0 else 0.0
+        # A per-call slurm_time wins over the instance one; without either the
+        # wall time follows CPU_MAX.
+        slurm_time = (job_properties or {}).get(
+            "slurm_time", self.executor_params.get("slurm_time")
+        )
+        timeout_min, partition = self._wall_time(sim, slurm_time)
 
         # Build executor parameters from defaults, instance-level kwargs,
         # then per-call overrides.
@@ -575,19 +573,15 @@ class ClusterSubmitter:
         # slot owns all n_omp cores and OMP_NUM_THREADS=n_omp fills them.
         params: dict[str, Any] = {
             "name": self.job_name if self.job_name is not None else sim.ham_name,
-            "timeout_min": int(timeout_hours * 60),
+            "timeout_min": timeout_min,
             "nodes": 1,
             "cpus_per_task": sim.n_omp,
             "tasks_per_node": sim.n_mpi if sim.mpi else 1,
         }
         if self.executor == "slurm":
             params["slurm_mem"] = self.slurm_mem
-            params["slurm_partition"] = self._select_partition(timeout_hours)
-            self._check_node_fit(sim, params["slurm_partition"])
-            if self.mail_type is not None:
-                params["slurm_mail_type"] = self.mail_type
-            if self.wckey is not None:
-                params["slurm_wckey"] = self.wckey
+            params["slurm_partition"] = partition
+            self._check_node_fit(sim, partition)
             if sim.mpi:
                 # submitit's default batch script wraps the Python launcher in
                 # `srun` *without* an explicit -n flag.  With
@@ -606,36 +600,10 @@ class ClusterSubmitter:
                 # mpiexec is called, consistent with cpus_per_task=n_omp so
                 # each MPI rank fills exactly its allocated cores with threads.
                 params["slurm_use_srun"] = False
-        if self.stderr_to_stdout:
-            params["stderr_to_stdout"] = True
-        params.update(self.slurm_kwargs)
-        if job_properties:
-            params.update(job_properties)
-        if "slurm_time" in params:
-            params["slurm_time"] = _slurm_time_to_minutes(params["slurm_time"])
-
-        if self.executor == "slurm":
-            extra = dict(params.get("slurm_additional_parameters") or {})
-            # Add 10% buffer so ALF can finish writing output after CPU_MAX;
-            # cap at the selected partition's wall-time limit.
-            # Skip auto-computation when the caller already supplied slurm_time
-            # (a submitit-style kwarg) or an explicit "time" in
-            # slurm_additional_parameters, so user-set wall times are never
-            # silently overwritten.
-            if "slurm_time" not in params and "time" not in extra:
-                slurm_time_h = timeout_hours * 1.1
-                selected = params.get("slurm_partition")
-                if (
-                    selected
-                    and self.partition_rules
-                    and selected in self.partition_rules
-                ):
-                    max_h = float(
-                        self.partition_rules[selected].get("max_hours", slurm_time_h)
-                    )
-                    slurm_time_h = min(slurm_time_h, max_h)
-                extra["time"] = int(slurm_time_h * 60)
-            params["slurm_additional_parameters"] = extra
+        params.update(self.executor_params)
+        params.update(job_properties or {})
+        # Consumed into timeout_min above.
+        params.pop("slurm_time", None)
 
         # Prepare simulation directories and copy binary. With prep=False the
         # runner preps on the node, so only the binary is staged here.
@@ -653,12 +621,10 @@ class ClusterSubmitter:
         )
         effective_submit_dir.mkdir(parents=True, exist_ok=True)
 
-        # submitit takes the requeue budget when the executor is *constructed*,
-        # not through update_parameters(), so it is pulled back out of params.
-        max_num_timeout = params.pop("slurm_max_num_timeout", None)
+        # submitit takes the requeue budget when the executor is constructed.
         executor_kwargs: dict[str, Any] = {}
-        if max_num_timeout is not None and self.executor == "slurm":
-            executor_kwargs["slurm_max_num_timeout"] = int(max_num_timeout)
+        if max_requeues is not None and self.executor == "slurm":
+            executor_kwargs["slurm_max_num_timeout"] = int(max_requeues)
 
         executor = submitit.AutoExecutor(
             folder=str(effective_submit_dir),

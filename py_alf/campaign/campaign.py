@@ -12,7 +12,7 @@ them to the target:
    ``data.h5`` and its checkpoint;
 2. submitit's checkpoint/requeue (see :func:`py_alf.campaign.worker.run_segment`)
    -- an automatic retry when the task is preempted or the time estimate was
-   wrong, bounded by ``slurm_max_num_timeout``;
+   wrong, bounded by the array's ``max_requeues``;
 3. :func:`Campaign.reconcile` -- repairs what neither covers: cancellation, node
    failure, an exhausted retry budget.
 
@@ -326,7 +326,7 @@ class Campaign:
         # countdown starts at ``attempts`` and is decremented once per
         # *timed-out* requeue (a preemption requeue does not decrement), and an
         # explicit name gives each array its own job name.
-        job_properties: dict[str, Any] = {"slurm_max_num_timeout": max(1, attempts)}
+        job_properties: dict[str, Any] = {}
         job_name = self._job_name(key)
         if job_name is not None:
             job_properties["name"] = job_name
@@ -347,6 +347,7 @@ class Campaign:
         jobs = self.submitter.submit(
             sims=[c.sim for c in chains],
             job_properties=job_properties,
+            max_requeues=max(1, attempts),
             runner=run_segment,
             prep=False,
             # launch has already left out every chain with an active job, so a

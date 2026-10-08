@@ -766,6 +766,15 @@ def test_launch_leaves_out_a_chain_whose_job_is_still_active(tmp_path):
     assert len(ledger.chains["free"]["segments"]) == 2
 
 
+def test_launch_hands_the_array_its_requeue_budget(tmp_path):
+    """The attempt count reaches submit as max_requeues, not a magic job property."""
+    camp, sub = _launch_campaign(tmp_path, [_chain(tmp_path, "a", 0)])
+    camp.launch(segments=4, verbose=False)
+
+    assert sub.calls[0]["max_requeues"] == 4
+    assert "slurm_max_num_timeout" not in sub.calls[0]["job_properties"]
+
+
 def test_launch_dry_run_submits_nothing_and_writes_no_ledger(tmp_path):
     camp, sub = _launch_campaign(tmp_path, [_chain(tmp_path, "a", 0)])
     camp.launch(dry_run=True, verbose=False)

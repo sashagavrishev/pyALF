@@ -32,10 +32,7 @@ def test_init_defaults():
         "long": {"max_hours": 168.0},
     }
     assert cs.job_name is None
-    assert cs.mail_type is None
-    assert cs.wckey is None
-    assert cs.stderr_to_stdout is False
-    assert cs.slurm_kwargs == {}
+    assert cs.executor_params == {}
 
 
 def test_init_custom():
@@ -50,7 +47,7 @@ def test_init_custom():
     assert cs.executor == "slurm"
     assert cs.slurm_mem == "8G"
     assert cs.partition_rules == {"gpu": {"max_hours": 24.0}}
-    assert cs.slurm_kwargs == {"slurm_extra": "foo"}
+    assert cs.executor_params == {"slurm_extra": "foo"}
 
 
 def test_init_requires_slurm_mem():
@@ -95,35 +92,15 @@ def test_init_local_rejects_slurm_prefixed_kwargs():
         ClusterSubmitter("local", slurm_constraint="gpu")
 
 
-def test_init_local_rejects_mail_type():
-    with pytest.raises(ValueError, match="mail_type"):
-        ClusterSubmitter("local", mail_type="END")
-
-
-def test_init_local_rejects_wckey():
-    with pytest.raises(ValueError, match="wckey"):
-        ClusterSubmitter("local", wckey="my-project")
-
-
-def test_init_slurm_extra_fields():
-    cs = ClusterSubmitter(
-        slurm_mem="4G",
-        partition_rules=_RULES,
-        job_name="my-job",
-        mail_type="END",
-        wckey="proj-key",
-        stderr_to_stdout=True,
-    )
-    assert cs.job_name == "my-job"
-    assert cs.mail_type == "END"
-    assert cs.wckey == "proj-key"
-    assert cs.stderr_to_stdout is True
+def test_init_local_rejects_slurm_options_passed_through():
+    with pytest.raises(ValueError, match="slurm_wckey"):
+        ClusterSubmitter("local", slurm_wckey="my-project")
 
 
 def test_init_job_name_and_stderr_accepted_for_local():
     cs = ClusterSubmitter("local", job_name="my-job", stderr_to_stdout=True)
     assert cs.job_name == "my-job"
-    assert cs.stderr_to_stdout is True
+    assert cs.executor_params == {"stderr_to_stdout": True}
 
 
 # --- _select_partition ---
@@ -372,14 +349,11 @@ def test_submit_auto_selects_long_partition(tmp_path):
 
 
 def test_submit_job_properties_slurm_time_selects_partition(tmp_path):
-    """A per-call slurm_time beats the instance one for partition and --time alike."""
+    """A per-call slurm_time beats the instance one for partition and wall time."""
     sim = _make_mock_sim(tmp_path / "sim0")
     sim.sim_dict = {"CPU_MAX": 2}
 
-    mock_job = MagicMock()
-    mock_job.job_id = "3"
-
-    with _patch_submitit(mock_job) as mock_executor:
+    with _patch_submitit(MagicMock(job_id="3")) as mock_executor:
         cs = ClusterSubmitter(
             submit_dir=tmp_path / "logs",
             slurm_mem="4G",
@@ -390,7 +364,52 @@ def test_submit_job_properties_slurm_time_selects_partition(tmp_path):
 
     call_kwargs = mock_executor.return_value.update_parameters.call_args.kwargs
     assert call_kwargs["slurm_partition"] == "long"
-    assert call_kwargs["slurm_time"] == 24 * 60
+    assert call_kwargs["timeout_min"] == 24 * 60
+    assert "slurm_time" not in call_kwargs
+
+
+def test_submit_wall_time_is_cpu_max_plus_ten_percent(tmp_path):
+    """ALF gets room to finish its last bin, within the partition's limit."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    sim.sim_dict = {"CPU_MAX": 2}
+
+    with _patch_submitit(MagicMock(job_id="1")) as mock_executor:
+        cs = ClusterSubmitter(
+            submit_dir=tmp_path / "logs", slurm_mem="2G", partition_rules=_RULES
+        )
+        cs.submit(sim)
+
+    call_kwargs = mock_executor.return_value.update_parameters.call_args.kwargs
+    assert call_kwargs["timeout_min"] == 132
+    assert "slurm_additional_parameters" not in call_kwargs
+
+
+def test_submit_wall_time_is_capped_at_the_partition_limit(tmp_path):
+    sim = _make_mock_sim(tmp_path / "sim0")
+    sim.sim_dict = {"CPU_MAX": 7.5}  # 7.5 h * 1.1 exceeds "short"'s 8 h
+
+    with _patch_submitit(MagicMock(job_id="1")) as mock_executor:
+        cs = ClusterSubmitter(
+            submit_dir=tmp_path / "logs", slurm_mem="2G", partition_rules=_RULES
+        )
+        cs.submit(sim)
+
+    call_kwargs = mock_executor.return_value.update_parameters.call_args.kwargs
+    assert call_kwargs["slurm_partition"] == "short"
+    assert call_kwargs["timeout_min"] == 8 * 60
+
+
+def test_submit_max_requeues_reaches_the_executor(tmp_path):
+    sim = _make_mock_sim(tmp_path / "sim0")
+    with _patch_submitit(MagicMock(job_id="1")) as mock_executor:
+        cs = ClusterSubmitter(
+            submit_dir=tmp_path / "logs", slurm_mem="2G", partition_rules=_RULES
+        )
+        cs.submit(sim, max_requeues=5)
+
+    assert mock_executor.call_args.kwargs["slurm_max_num_timeout"] == 5
+    params = mock_executor.return_value.update_parameters.call_args.kwargs
+    assert "slurm_max_num_timeout" not in params
 
 
 def test_submit_job_name_overrides_ham_name(tmp_path):
@@ -426,18 +445,17 @@ def test_submit_default_name_is_ham_name(tmp_path):
     assert call_kwargs["name"] == sim.ham_name
 
 
-def test_submit_mail_type_and_wckey_in_slurm_params(tmp_path):
-    """mail_type and wckey appear in SLURM update_parameters call."""
+def test_submit_passes_slurm_options_through(tmp_path):
+    """slurm_* options given to the constructor reach update_parameters."""
     sim = _make_mock_sim(tmp_path / "sim0")
-    mock_job = MagicMock(job_id="1")
 
-    with _patch_submitit(mock_job) as mock_executor:
+    with _patch_submitit(MagicMock(job_id="1")) as mock_executor:
         cs = ClusterSubmitter(
             submit_dir=tmp_path / "logs",
             slurm_mem="2G",
             partition_rules=_RULES,
-            mail_type="END",
-            wckey="proj-key",
+            slurm_mail_type="END",
+            slurm_wckey="proj-key",
         )
         cs.submit(sim)
 
@@ -844,28 +862,6 @@ def test_submit_non_mpi_sim_has_no_use_srun(tmp_path):
     call_kwargs = mock_executor.return_value.update_parameters.call_args.kwargs
     assert "use_srun" not in call_kwargs
     assert "slurm_use_srun" not in call_kwargs
-
-
-def test_submit_uses_prefixed_additional_parameters(tmp_path):
-    """The auto wall-time goes via slurm_additional_parameters, not the
-    deprecated unprefixed additional_parameters key."""
-    sim = _make_mock_sim(tmp_path / "sim0")
-    sim.sim_dict = {"CPU_MAX": 1}  # CPU_MAX mode → submit derives a wall time
-
-    mock_job = MagicMock()
-    mock_job.job_id = "1"
-
-    with _patch_submitit(mock_job) as mock_executor:
-        cs = ClusterSubmitter(
-            submit_dir=tmp_path / "logs",
-            slurm_mem="2G",
-            partition_rules=_RULES,
-        )
-        cs.submit(sim)
-
-    call_kwargs = mock_executor.return_value.update_parameters.call_args.kwargs
-    assert "additional_parameters" not in call_kwargs  # legacy key not passed
-    assert "time" in call_kwargs["slurm_additional_parameters"]
 
 
 # --- _parse_slurm_time_hours ---
