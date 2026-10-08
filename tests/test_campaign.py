@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import submitit
 
+from py_alf.bins import read_bin_counts
 from py_alf.campaign import (
     Ledger,
     SegmentPolicy,
@@ -905,6 +906,31 @@ def test_reconcile_resubmits_only_what_stalled(tmp_path):
 
     resubmitted = {s.sim_dir for call in sub.calls for s in call["sims"]}
     assert resubmitted == {str(tmp_path / "resumable"), str(tmp_path / "unstarted")}
+
+
+def test_reconcile_reads_each_data_file_at_most_once(tmp_path):
+    """launch reuses the counts status just resolved instead of re-reading."""
+    camp, sub, states = _reconcile_campaign(
+        tmp_path,
+        {"resumable": (40, "FAILED"), "unstarted": (0, None)},
+    )
+    reads: list[str] = []
+
+    def _counted(paths, *a, **k):
+        reads.extend(paths)
+        return read_bin_counts(paths, *a, **k)
+
+    with (
+        patch("py_alf.campaign.campaign.job_states", return_value=states),
+        patch("py_alf.campaign.campaign.read_bin_counts", side_effect=_counted),
+    ):
+        camp.reconcile(verbose=False)
+
+    assert len(reads) == len(set(reads))
+    assert {s.sim_dir for call in sub.calls for s in call["sims"]} == {
+        str(tmp_path / "resumable"),
+        str(tmp_path / "unstarted"),
+    }
 
 
 def test_reconcile_leaves_a_suspect_chain_alone_until_forced(tmp_path):

@@ -20,6 +20,7 @@ import pandas as pd
 from .alf_source import ALF_source
 from .ana import load_res
 from .analysis import analysis
+from .bins import read_bin_count
 
 
 class cd:
@@ -256,6 +257,10 @@ class Simulation:
             exec_alf_binary(self, executable)
         except subprocess.CalledProcessError as ALF_crash:
             raise RuntimeError(f"Error while running {executable}.") from ALF_crash
+
+    def bin_count(self, counting_obs="Ener_scal"):
+        """Bins of *counting_obs* in this simulation's ``data.h5`` (0 if none)."""
+        return read_bin_count(os.path.join(self.sim_dir, "data.h5"), counting_obs)
 
     def get_directories(self):
         """Return list of directories connected to this simulation."""

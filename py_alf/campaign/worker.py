@@ -53,7 +53,7 @@ class SegmentPlan:
 
 def _count_bins(sim, counting_obs: str = DEFAULT_COUNTING_OBS) -> int:
     """Bins currently in this chain's ``data.h5`` (0 when it does not exist)."""
-    return int(sim.bin_count(counting_obs=counting_obs, refresh=True, force=True))
+    return sim.bin_count(counting_obs)
 
 
 def _claim_running(sim_dir: Path, job_id: str) -> None:

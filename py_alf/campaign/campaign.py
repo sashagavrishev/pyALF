@@ -37,7 +37,7 @@ from typing import Any
 
 from .._io import map_io
 from ..alf_source import ALF_source
-from ..bins import _bin_cache, read_bin_counts
+from ..bins import read_bin_counts
 from ..cluster_submission import ClusterSubmitter
 from ..simulation import Simulation
 from ..slurm import ACTIVE_STATES, is_timeout, job_states
@@ -206,13 +206,15 @@ class Campaign:
         segments: int | None = None,
         dry_run: bool = False,
         verbose: bool = True,
+        bins: dict[str, int] | None = None,
     ) -> Ledger:
         """Queue the campaign: one SLURM array per group of chains.
 
         ``segments`` is the number of *attempts* a task may make: the first run
         plus the requeues submitit is allowed to perform. Chains that are
         already complete, or that still have an active job, are left alone -- so
-        relaunching a campaign tops up only what needs it.
+        relaunching a campaign tops up only what needs it. ``bins`` holds counts
+        already resolved by :meth:`status`, by chain id; other chains are read.
         """
         if not self.chains:
             raise SystemExit("Campaign has no chains; check the parameter grid.")
@@ -229,7 +231,7 @@ class Campaign:
 
         rules = self.partition_rules
         for key, chains in self.groups().items():
-            runnable = self._runnable(chains)
+            runnable = self._runnable(chains, bins or {})
             if not runnable:
                 if verbose:
                     print(f"[{key or self.name}] nothing to submit.")
@@ -271,7 +273,9 @@ class Campaign:
                 print(f"Ledger: {ledger.path}")
         return ledger
 
-    def _runnable(self, chains: list[Chain]) -> list[tuple[Chain, int]]:
+    def _runnable(
+        self, chains: list[Chain], known: dict[str, int]
+    ) -> list[tuple[Chain, int]]:
         """Chains short of the target, each with the bin count that decided it.
 
         Chains still held by SLURM are dropped by ``ClusterSubmitter.submit``
@@ -281,9 +285,12 @@ class Campaign:
         array's budget needs the same number, and re-reading the whole grid to
         get it would double the launch's filesystem cost.
         """
-        bins = read_bin_counts(
-            [os.path.join(c.sim_dir, "data.h5") for c in chains], self.counting_obs
+        unread = [c for c in chains if c.chain_id not in known]
+        read = read_bin_counts(
+            [os.path.join(c.sim_dir, "data.h5") for c in unread], self.counting_obs
         )
+        counts = {**known, **dict(zip((c.chain_id for c in unread), read, strict=True))}
+        bins = [counts[c.chain_id] for c in chains]
         return [
             (c, b) for c, b in zip(chains, bins, strict=True) if b < self.target_bins
         ]
@@ -392,7 +399,6 @@ class Campaign:
         have changed underneath the ledger (files restored, a chain re-run by
         hand, a count written by an older version).
         """
-        by_id = {c.chain_id: c for c in self.chains}
         known: dict[str, int] = {}
         needs_read: list[str] = []
 
@@ -429,15 +435,6 @@ class Campaign:
                 ),
             )
             known.update(zip(needs_read, counts, strict=True))
-            # A chain whose Simulation was rebuilt shares Simulation.bin_count's
-            # cache, so keep that consistent with what was just read rather than
-            # letting a later call re-open the same file.
-            for chain_id in needs_read:
-                chain = by_id.get(chain_id)
-                if chain is not None:
-                    _bin_cache[
-                        (os.path.join(chain.sim_dir, "data.h5"), self.counting_obs)
-                    ] = known[chain_id]
 
         return known
 
@@ -592,7 +589,11 @@ class Campaign:
             return statuses
 
         subset = replace(self, chains=[c for c in self.chains if c.chain_id in needy])
-        subset.launch(segments=segments, verbose=verbose)
+        subset.launch(
+            segments=segments,
+            verbose=verbose,
+            bins={s.chain_id: s.bins for s in statuses},
+        )
         return statuses
 
 
