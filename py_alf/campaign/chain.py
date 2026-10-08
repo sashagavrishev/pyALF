@@ -49,7 +49,6 @@ class Chain:
     # the chain distinct beyond its Markov seed goes here -- a disorder seed, a
     # sweep value -- so the core needs no field per experiment shape.
     point: dict[str, Any] = field(default_factory=dict)
-    init_config: str | None = None
     # Chains sharing an array_key are submitted as one SLURM array, so they must
     # share a cost: by convention one key per parameter point.
     array_key: str = ""
@@ -68,7 +67,6 @@ class Chain:
             "mc_seed": self.mc_seed,
             "target_bins": self.target_bins,
             "point": dict(self.point),
-            "init_config": self.init_config,
             "array_key": self.array_key,
             "params": {
                 k: v for k, v in self.sim.sim_dict.items() if k not in RUN_CONTROL_KEYS

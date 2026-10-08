@@ -217,171 +217,6 @@ def _parse_slurm_time_hours(time_str: str) -> float | None:
         return None
 
 
-def detect_partition_rules(
-    exclude: list[str] | None = None,
-    include: list[str] | None = None,
-    mem_headroom_gb: float = 2.0,
-    timeout: float = 10.0,
-) -> dict[str, PartitionSpec]:
-    """Query the local SLURM installation and build a *partition_rules* dict.
-
-    Runs ``sinfo -o "%P|%l|%c|%m" --noheader`` and converts the output into
-    a mapping of partition name → :class:`PartitionSpec`.  When a partition
-    has multiple node groups (multiple ``sinfo`` lines), the *minimum* CPU
-    count and *minimum* memory are used — the conservative choice that
-    guarantees the limits hold for every node in the partition.
-
-    Partitions with an ``UNLIMITED`` time limit are excluded because
-    :class:`ClusterSubmitter` requires a finite ``max_hours`` to select
-    a partition automatically.
-
-    Parameters
-    ----------
-    exclude : list of str, optional
-        Partition names to ignore, e.g. GPU-only or interactive partitions.
-        Matching is case-insensitive.
-    include : list of str, optional
-        If given, *only* these partition names are returned; all others are
-        dropped.  Matching is case-insensitive.
-    mem_headroom_gb : float
-        Gigabytes subtracted from the raw per-node memory reported by
-        ``sinfo`` to leave headroom for OS and system daemons.
-        Default is ``2.0``.
-    timeout : float
-        Seconds to wait for the ``sinfo`` subprocess before raising.
-        Default is ``10.0``.
-
-    Returns
-    -------
-    dict[str, PartitionSpec]
-        Ready to pass directly to :class:`ClusterSubmitter` as
-        *partition_rules*.
-
-    Raises
-    ------
-    RuntimeError
-        If ``sinfo`` is not found on PATH, times out, or returns no
-        partitions that survive the filters and have finite time limits.
-
-    Examples
-    --------
-    Detect all finite-time-limit partitions, excluding the GPU queue::
-
-        rules = detect_partition_rules(exclude=["gpu"])
-        cs = ClusterSubmitter("slurm", slurm_mem="8G", partition_rules=rules)
-
-    Detect only specific partitions::
-
-        rules = detect_partition_rules(include=["short", "medium", "long"])
-    """
-    exclude_set = {p.lower() for p in (exclude or [])}
-    include_set = {p.lower() for p in include} if include else None
-
-    try:
-        result = subprocess.run(
-            ["sinfo", "-o", "%P|%l|%c|%m", "--noheader"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            "detect_partition_rules: 'sinfo' not found — "
-            "is SLURM installed and on PATH?"
-        ) from None
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"detect_partition_rules: 'sinfo' timed out after {timeout} s"
-        ) from None
-
-    # Accumulate (max_hours, cpus, mem_mb) tuples per partition name.
-    # Multiple tuples arise when a partition spans several node groups.
-    raw: dict[str, list[tuple[float, int, int]]] = {}
-
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split("|")
-        if len(parts) < 4:
-            logger.debug("detect_partition_rules: skipping unrecognised line %r", line)
-            continue
-        name_raw, time_raw, cpus_raw, mem_raw = parts[:4]
-
-        # SLURM marks the default partition with a trailing '*'
-        name = name_raw.strip().rstrip("*").strip()
-        if not name:
-            continue
-
-        if name.lower() in exclude_set:
-            continue
-        if include_set is not None and name.lower() not in include_set:
-            continue
-
-        hours = _parse_slurm_time_hours(time_raw)
-        if hours is None:
-            logger.debug(
-                "detect_partition_rules: skipping partition %r (UNLIMITED time)", name
-            )
-            continue
-
-        try:
-            # sinfo may report "72+" meaning ≥72 CPUs; strip any trailing non-digit chars
-            cpus = int(cpus_raw.strip().rstrip("+"))
-        except ValueError:
-            logger.warning(
-                "detect_partition_rules: cannot parse CPU count %r for %r — skipping row",
-                cpus_raw,
-                name,
-            )
-            continue
-
-        try:
-            mem_mb = int(mem_raw.strip().rstrip("+"))
-        except ValueError:
-            logger.warning(
-                "detect_partition_rules: cannot parse memory %r for %r — skipping row",
-                mem_raw,
-                name,
-            )
-            continue
-
-        raw.setdefault(name, []).append((hours, cpus, mem_mb))
-
-    if not raw:
-        raise RuntimeError(
-            "detect_partition_rules: no usable partitions found after filtering. "
-            "Verify that 'sinfo' is working and adjust the exclude/include lists."
-        )
-
-    rules: dict[str, PartitionSpec] = {}
-    for name, entries in raw.items():
-        max_hours = min(h for h, _, _ in entries)
-        max_cpus = min(c for _, c, _ in entries)
-        raw_mem_gb = min(m for _, _, m in entries) / 1024 - mem_headroom_gb
-        if raw_mem_gb <= 0:
-            logger.warning(
-                "detect_partition_rules: partition %r has %.1f GB after headroom "
-                "deduction — skipping.",
-                name,
-                raw_mem_gb + mem_headroom_gb,
-            )
-            continue
-        rules[name] = PartitionSpec(
-            max_hours=max_hours,
-            max_cpus=max_cpus,
-            max_mem_gb=round(raw_mem_gb, 3),
-        )
-
-    if not rules:
-        raise RuntimeError(
-            "detect_partition_rules: all detected partitions were excluded or had "
-            "unusable specs (e.g. memory too small after headroom deduction)."
-        )
-
-    return rules
-
-
 def _project_root() -> Path:
     """Walk up from CWD to find the project root, identified by .git or common markers.
 
@@ -398,38 +233,6 @@ def _project_root() -> Path:
         if parent == current:
             return Path.cwd()
         current = parent
-
-
-def _unique_slurm_job_name(base_name: str) -> str:
-    """Return a SLURM job name that is not currently held by any queued job.
-
-    Queries ``squeue`` for all active jobs whose name starts with *base_name*
-    and appends a numeric suffix (``_2``, ``_3``, …) until an unused name is
-    found.  If ``squeue`` is unavailable the original name is returned unchanged
-    so that submission is never blocked.
-    """
-    try:
-        result = subprocess.run(
-            ["squeue", "-h", "-o", "%j"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        active_names: set[str] = {
-            line.strip() for line in result.stdout.splitlines() if line.strip()
-        }
-    except Exception:
-        return base_name
-
-    if base_name not in active_names:
-        return base_name
-
-    for suffix in range(2, 10000):
-        candidate = f"{base_name}_{suffix}"
-        if candidate not in active_names:
-            return candidate
-
-    return base_name
 
 
 def _exec_alf_binary(
@@ -907,11 +710,8 @@ class ClusterSubmitter:
         #
         # For a pure-OpenMP (no MPI) job tasks_per_node is 1, so a single task
         # slot owns all n_omp cores and OMP_NUM_THREADS=n_omp fills them.
-        base_name = self.job_name if self.job_name is not None else sim.ham_name
-        if self.executor == "slurm" and self.job_name is None:
-            base_name = _unique_slurm_job_name(base_name)
         params: dict[str, Any] = {
-            "name": base_name,
+            "name": self.job_name if self.job_name is not None else sim.ham_name,
             "timeout_min": int(timeout_hours * 60),
             "nodes": 1,
             "cpus_per_task": sim.n_omp,

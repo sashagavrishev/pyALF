@@ -3,9 +3,7 @@
 The ledger is the campaign's index. It maps every ``chain_id`` to its
 Monte-Carlo seed, ``sim_dir``, grid coordinates (``point``) and job history,
 which is what lets a later process -- ``reconcile``, an analysis script --
-pick up a run it did not submit. It also answers the reverse question,
-"which chain sits at grid coordinate X", that a per-chain result needs to be
-traced back (:meth:`Ledger.by_point_key`).
+pick up a run it did not submit.
 
 Writes are driver-side and atomic (temp file + ``os.replace``): a crashed or
 concurrently-running driver can never leave a half-written index. Workers never
@@ -28,29 +26,13 @@ from ..cluster_submission import _map_io
 SEGMENT_SUBDIR = "segments"
 LEDGER_VERSION = 1
 
-# Point coordinates that older ledgers stored as top-level record keys, before
-# every grid coordinate moved into ``point``. Folded back in on read so a
-# campaign launched then can still be reopened.
-LEGACY_POINT_KEYS = ("disorder_seed",)
-
-# Observable whose bin count measures progress. Recorded per campaign, since a
-# ledger that did not name it would make ``status`` report zero bins for every
-# chain of a model that counts something else.
+# Observable whose bin count measures progress, recorded per campaign.
 DEFAULT_COUNTING_OBS = "Ener_scal"
 
 
 def segment_dir(sim_dir: str | Path) -> Path:
     """Directory holding one chain's worker-written segment records."""
     return Path(sim_dir) / SEGMENT_SUBDIR
-
-
-def chain_point(record: dict[str, Any]) -> dict[str, Any]:
-    """Grid coordinates of one ledger chain record, legacy keys folded in."""
-    point = dict(record.get("point") or {})
-    for key in LEGACY_POINT_KEYS:
-        if key not in point and key in record:
-            point[key] = record[key]
-    return point
 
 
 def ledger_path(data_dir: str | Path, name: str) -> Path:
@@ -209,7 +191,7 @@ class Ledger:
 
         ``scontrol requeue`` reuses the job id, so several worker records can
         match one submitted segment. Records are read in filename order, which
-        is attempt-then-timestamp, so the ledger ends up holding the latest
+        is job-then-timestamp, so the ledger ends up holding the latest
         attempt; the per-chain record files keep them all, which is what
         :func:`~py_alf.campaign.worker.measured_hours_per_bin` reads.
 
@@ -279,54 +261,8 @@ class Ledger:
 
     @property
     def counting_obs(self) -> str:
-        """Observable this campaign counts bins of (ledgers predating it: default)."""
-        return str(self.data.get("counting_obs") or DEFAULT_COUNTING_OBS)
+        return str(self.data["counting_obs"])
 
     @property
     def chains(self) -> dict[str, dict[str, Any]]:
         return self.data["chains"]
-
-    def chain(self, chain_id: str) -> dict[str, Any]:
-        return self.data["chains"][chain_id]
-
-    def point(self, chain_id: str) -> dict[str, Any]:
-        """Grid coordinates of one chain, legacy keys folded in."""
-        return chain_point(self.chain(chain_id))
-
-    def by_point_key(self, key: str) -> dict[Any, str]:
-        """``point[key] -> chain_id``, the reverse index for tracing results.
-
-        Only meaningful when ``key`` alone identifies a chain: a grid reuses the
-        same disorder seeds at every parameter point, say, so a campaign
-        spanning several points maps such a value to the last chain carrying it.
-        Use :meth:`chain_ids_by_point_key` when the grid has more than one point.
-        Chains whose point lacks ``key`` are skipped.
-        """
-        out: dict[Any, str] = {}
-        for cid, record in self.chains.items():
-            point = chain_point(record)
-            if key in point:
-                out[point[key]] = cid
-        return out
-
-    def chain_ids_by_point_key(self, key: str) -> dict[Any, list[str]]:
-        """``point[key] -> [chain_id, ...]`` across every parameter point."""
-        out: dict[Any, list[str]] = {}
-        for cid, record in self.chains.items():
-            point = chain_point(record)
-            if key in point:
-                out.setdefault(point[key], []).append(cid)
-        return out
-
-    def by_sim_dir(self) -> dict[str, str]:
-        """``sim_dir -> chain_id``."""
-        return {r["sim_dir"]: cid for cid, r in self.chains.items()}
-
-    def last_segment_job_ids(self) -> list[str]:
-        """Job ids of each chain's most recent segment, for dependency gating."""
-        ids = []
-        for record in self.chains.values():
-            segments = record.get("segments", [])
-            if segments and segments[-1].get("job_id"):
-                ids.append(segments[-1]["job_id"])
-        return ids

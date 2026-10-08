@@ -30,7 +30,6 @@ saying what a bin of *its* Hamiltonian costs.
 from __future__ import annotations
 
 import os
-import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -47,7 +46,7 @@ from ..cluster_submission import (
 )
 from ..simulation import Simulation
 from .chain import Chain
-from .ledger import DEFAULT_COUNTING_OBS, Ledger, chain_point
+from .ledger import DEFAULT_COUNTING_OBS, Ledger
 from .policy import SegmentPolicy
 from .worker import SegmentPlan, measured_hours_per_bin, run_segment
 
@@ -107,7 +106,6 @@ class Campaign:
     partition_rules: dict[str, Any] = field(default_factory=dict)
     policy: SegmentPolicy = field(default_factory=SegmentPolicy)
     job_name_prefix: str | None = None
-    hours_per_bin: dict[str, float] = field(default_factory=dict)
     # Observable whose bin count measures progress, and the a-priori
     # hours-per-bin estimate for a chain that has not measured itself yet
     # (``None`` falls back to :data:`DEFAULT_HOURS_PER_BIN`).
@@ -121,23 +119,6 @@ class Campaign:
     # --- construction -------------------------------------------------------
 
     @classmethod
-    def build(
-        cls,
-        name: str,
-        chains: list[Chain],
-        target_bins: int,
-        **kwargs,
-    ) -> Campaign:
-        if not chains:
-            raise SystemExit("Campaign has no chains; check the parameter grid.")
-        return cls(
-            name=name,
-            chains=list(chains),
-            target_bins=target_bins,
-            **kwargs,
-        )
-
-    @classmethod
     def from_ledger(
         cls,
         ledger_path: str | Path,
@@ -146,7 +127,6 @@ class Campaign:
         *,
         alf_src: ALF_source | None = None,
         machine: str = "GNU",
-        default_ham_name: str | None = None,
         cost_model: Callable[[dict], float] | None = None,
         **kwargs,
     ) -> Campaign:
@@ -159,22 +139,15 @@ class Campaign:
         ``sim_dir`` so the rebuilt chain resolves to the very same directory.
 
         ``machine`` and ``alf_src`` say where to find the binary those rebuilt
-        simulations would run; ``default_ham_name`` names the model for ledgers
-        written before the chains recorded it themselves.
+        simulations would run.
         """
         ledger = Ledger.load(ledger_path)
         alf_src = alf_src if alf_src is not None else ALF_source()
         chains = []
         for cid, record in ledger.chains.items():
-            ham_name = record.get("ham_name") or default_ham_name
-            if not ham_name:
-                raise SystemExit(
-                    f"{ledger_path}: chain {cid} does not record its Hamiltonian; "
-                    "pass default_ham_name to name the model it was launched for."
-                )
             sim = Simulation(
                 alf_src,
-                ham_name,
+                record["ham_name"],
                 dict(record["params"]),
                 mc_seed=record["mc_seed"],
                 machine=machine,
@@ -186,10 +159,9 @@ class Campaign:
                     chain_id=cid,
                     sim=sim,
                     mc_seed=record["mc_seed"],
-                    target_bins=record.get("target_bins", ledger.target_bins),
-                    point=chain_point(record),
-                    init_config=record.get("init_config"),
-                    array_key=record.get("array_key", ""),
+                    target_bins=record["target_bins"],
+                    point=record["point"],
+                    array_key=record["array_key"],
                 )
             )
         return cls(
@@ -224,36 +196,15 @@ class Campaign:
     def hours_per_bin_for(self, chain: Chain) -> float:
         """Best available seconds-per-bin estimate for ``chain``, in hours.
 
-        Measurement from the chain's own history wins; failing that an explicit
-        per-array override; failing that the injected cost model, and only then
-        a flat guess.
+        Measurement from the chain's own history wins; failing that the
+        injected cost model, and only then a flat guess.
         """
         measured = measured_hours_per_bin(chain.sim_dir)
         if measured:
             return measured
-        if chain.array_key in self.hours_per_bin:
-            return self.hours_per_bin[chain.array_key]
         if self.cost_model is None:
             return DEFAULT_HOURS_PER_BIN
         return self.cost_model(chain.sim.sim_dict)
-
-    def bins_on_disk(self, chain: Chain) -> int:
-        """Bins currently in one chain's ``data.h5``."""
-        return self.bins_on_disk_many([chain])[0]
-
-    def bins_on_disk_many(self, chains: list[Chain]) -> list[int]:
-        """Bins in each chain's ``data.h5``, read as one batch.
-
-        Batched rather than one call per chain: h5py serializes every call
-        within one process (see ``_get_process_pool``'s docstring), so the reads
-        have to be spread over separate OS processes to overlap at all -- and
-        handing that pool one file per task makes each read cost an IPC round
-        trip instead, which on a campaign-sized grid is the whole cost. See
-        :func:`~py_alf.cluster_submission._bin_counts`.
-        """
-        return _bin_counts(
-            [os.path.join(c.sim_dir, "data.h5") for c in chains], self.counting_obs
-        )
 
     # --- launching ----------------------------------------------------------
 
@@ -270,6 +221,8 @@ class Campaign:
         already complete, or that still have an active job, are left alone -- so
         relaunching a campaign tops up only what needs it.
         """
+        if not self.chains:
+            raise SystemExit("Campaign has no chains; check the parameter grid.")
         ledger = Ledger.load_or_new(
             self.ledger_path,
             name=self.name,
@@ -335,7 +288,9 @@ class Campaign:
         array's budget needs the same number, and re-reading the whole grid to
         get it would double the launch's filesystem cost.
         """
-        bins = self.bins_on_disk_many(chains)
+        bins = _bin_counts(
+            [os.path.join(c.sim_dir, "data.h5") for c in chains], self.counting_obs
+        )
         return [
             (c, b) for c, b in zip(chains, bins, strict=True) if b < self.target_bins
         ]
@@ -353,7 +308,7 @@ class Campaign:
         # Per-array overrides of the shared submitter: submitit's requeue
         # countdown starts at ``attempts`` and is decremented once per
         # *timed-out* requeue (a preemption requeue does not decrement), and an
-        # explicit name keeps one stable, unsuffixed job name per array.
+        # explicit name gives each array its own job name.
         job_properties: dict[str, Any] = {"slurm_max_num_timeout": max(1, attempts)}
         job_name = self._job_name(key)
         if job_name is not None:
@@ -363,12 +318,10 @@ class Campaign:
         for chain, _, hpb in plans:
             chain.sim.sim_dict = {**chain.sim.sim_dict, "CPU_MAX": float(ceiling)}
             chain.sim.segment_plan = SegmentPlan(
-                index=0,
                 target_bins=self.target_bins,
                 hours_per_bin=hpb,
                 partition_rules=rules,
                 policy=self.policy,
-                init_config=chain.init_config,
                 chain_id=chain.chain_id,
                 cpu_max_ceiling=float(ceiling),
                 counting_obs=self.counting_obs,
@@ -399,7 +352,6 @@ class Campaign:
             ledger.add_segment(
                 chain.chain_id,
                 {
-                    "index": 0,
                     "job_id": job_id,
                     "cpu_max_planned": float(ceiling),
                 },
@@ -587,7 +539,7 @@ class Campaign:
             return ChainStatus(
                 chain_id=chain_id,
                 sim_dir=record["sim_dir"],
-                point=chain_point(record),
+                point=record["point"],
                 bins=bins,
                 target_bins=ledger.target_bins,
                 segments=len(segments),
@@ -649,46 +601,6 @@ class Campaign:
         subset = replace(self, chains=[c for c in self.chains if c.chain_id in needy])
         subset.launch(segments=segments, verbose=verbose)
         return statuses
-
-    # --- chaining -----------------------------------------------------------
-
-    def then(
-        self,
-        command: list[str],
-        depends: str = "afterany",
-        ledger: Ledger | None = None,
-        dry_run: bool = False,
-    ) -> str | None:
-        """Queue ``command`` (an ``sbatch`` argument list) after the campaign.
-
-        Gated on every chain's most recent segment, so an analysis stage can be
-        submitted at the same time as the simulations it consumes. ``afterany``,
-        not ``afterok``: a chain that stopped on the wall clock has still
-        produced usable bins.
-        """
-        ledger = ledger or Ledger.load(self.ledger_path)
-        job_ids = sorted({j.split("_")[0] for j in ledger.last_segment_job_ids()})
-        if not job_ids:
-            raise SystemExit("Campaign has no submitted segments to depend on.")
-
-        cmd = [
-            "sbatch",
-            "--parsable",
-            f"--dependency={depends}:{':'.join(job_ids)}",
-            *command,
-        ]
-        if dry_run:
-            print(" ".join(cmd))
-            return None
-
-        job_id = subprocess.run(
-            cmd, check=True, capture_output=True, text=True
-        ).stdout.strip()
-        ledger.add_followup(
-            {"job_id": job_id, "command": command, "dependency": depends}
-        )
-        ledger.save()
-        return job_id
 
 
 def _has_active_job(record: dict[str, Any], states: dict[str, dict]) -> bool:

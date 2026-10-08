@@ -24,7 +24,6 @@ from .chain import Chain, chain_id
 from .ledger import (
     DEFAULT_COUNTING_OBS,
     Ledger,
-    chain_point,
     ledger_path,
     segment_dir,
 )
@@ -42,7 +41,6 @@ __all__ = [
     "SegmentPlan",
     "SegmentPolicy",
     "chain_id",
-    "chain_point",
     "ledger_path",
     "measured_hours_per_bin",
     "run_segment",

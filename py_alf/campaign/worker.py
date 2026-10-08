@@ -13,9 +13,8 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -39,7 +38,6 @@ class SegmentPlan:
     node needs no access to the ledger.
     """
 
-    index: int  # attempt number, for logging and record names only
     target_bins: int
     hours_per_bin: float  # a-priori estimate, superseded by measurement
     partition_rules: dict
@@ -49,7 +47,6 @@ class SegmentPlan:
     # let ALF run past the point where SLURM kills it, losing the graceful
     # truncation this whole mechanism depends on.
     cpu_max_ceiling: float = 0.0
-    init_config: str | None = None
     chain_id: str = ""
     counting_obs: str = DEFAULT_COUNTING_OBS
 
@@ -108,36 +105,6 @@ def measured_hours_per_bin(sim_dir: str | Path) -> float | None:
     return best[1] if best else None
 
 
-def _seed_initial_config(sim_dir: Path, init_config: str | None) -> str | None:
-    """Warm-start from another chain's final configuration, if asked.
-
-    Only ever applies to a chain that has not run: an existing ``confin_*`` or
-    ``confout_*`` is this chain's own state and always wins.
-    """
-    if not init_config:
-        return None
-    if any(sim_dir.glob("confin_*")) or any(sim_dir.glob("confout_*")):
-        return None
-
-    source = Path(init_config)
-    if source.is_dir():
-        candidates = [
-            source / "confout_0.h5",
-            source / "confin_0.h5",
-            source / "confout_0",
-            source / "confin_0",
-        ]
-        source = next((c for c in candidates if c.exists()), source / "confout_0.h5")
-    if not source.exists():
-        raise FileNotFoundError(
-            f"init_config {init_config!r} has no configuration file"
-        )
-
-    target = sim_dir / ("confin_0.h5" if source.suffix == ".h5" else "confin_0")
-    shutil.copy(source, target)
-    return str(source)
-
-
 def run_segment(sim) -> None:
     """Run one checkpoint-restart segment of ``sim``'s Markov chain."""
     plan: SegmentPlan = sim.segment_plan
@@ -149,14 +116,14 @@ def run_segment(sim) -> None:
 
     if _clear_own_running(sim_dir, job_id):
         print(
-            f"[segment {plan.index}] {sim_dir.name}: cleared RUNNING left by this "
+            f"[segment] {sim_dir.name}: cleared RUNNING left by this "
             f"job's interrupted attempt ({job_id})."
         )
 
     bins_before = _count_bins(sim, plan.counting_obs)
     if bins_before >= plan.target_bins:
         print(
-            f"[segment {plan.index}] {sim_dir.name}: {bins_before}/{plan.target_bins} "
+            f"[segment] {sim_dir.name}: {bins_before}/{plan.target_bins} "
             "bins already present, nothing to do."
         )
         return
@@ -166,8 +133,6 @@ def run_segment(sim) -> None:
     cpu_max = plan.policy.cpu_max(remaining, hours_per_bin, plan.partition_rules)
     if plan.cpu_max_ceiling:
         cpu_max = min(cpu_max, plan.cpu_max_ceiling)
-
-    seeded_from = _seed_initial_config(sim_dir, plan.init_config)
 
     # Both bounds, so ALF stops at whichever comes first: CPU_MAX keeps the job
     # inside its allocation, NBin stops it exactly at the target when the target
@@ -182,7 +147,7 @@ def run_segment(sim) -> None:
     }
 
     print(
-        f"[segment {plan.index}] {sim_dir.name}: {bins_before}/{plan.target_bins} bins, "
+        f"[segment] {sim_dir.name}: {bins_before}/{plan.target_bins} bins, "
         f"{remaining} to go at {hours_per_bin * 60:.2f} min/bin "
         f"-> CPU_MAX={cpu_max:.3f} h, NBin={remaining}"
     )
@@ -209,7 +174,6 @@ def run_segment(sim) -> None:
     bins_after = _count_bins(sim, plan.counting_obs)
     record = {
         "job_id": job_id,
-        "index": plan.index,
         "chain_id": plan.chain_id,
         # What this segment's bins were actually computed with, not what HEAD
         # is now -- lets a later archival pass tell old-commit bins apart from
@@ -220,21 +184,18 @@ def run_segment(sim) -> None:
         "bins_before": bins_before,
         "bins_after": bins_after,
         "elapsed_s": round(elapsed, 1),
-        "seeded_from": seeded_from,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
     }
     out_dir = segment_dir(sim_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Index and timestamp, not the job id alone: SLURM reuses a job id when it
+    # Job id and timestamp, not the job id alone: SLURM reuses a job id when it
     # requeues, so a requeued attempt would otherwise overwrite the record of
     # the attempt it is replacing, losing that segment's timing measurement.
     stamp = record["finished_at"].replace(":", "").replace("-", "")
-    (out_dir / f"{plan.index:03d}-{job_id}-{stamp}.json").write_text(
-        json.dumps(record, indent=2)
-    )
+    (out_dir / f"{job_id}-{stamp}.json").write_text(json.dumps(record, indent=2))
 
     print(
-        f"[segment {plan.index}] {sim_dir.name}: {bins_before} -> {bins_after} bins "
+        f"[segment] {sim_dir.name}: {bins_before} -> {bins_after} bins "
         f"in {elapsed / 3600:.2f} h"
     )
 
@@ -257,10 +218,3 @@ def _checkpoint_segment(sim) -> submitit.helpers.DelayedSubmission:
 # submitit looks this attribute up on the submitted function itself, so it has
 # to exist after a plain import on the node.
 run_segment.checkpoint = _checkpoint_segment
-
-
-def plan_as_dict(plan: SegmentPlan) -> dict:
-    """JSON-safe view of a plan, for dry-run output and the ledger."""
-    data = asdict(plan)
-    data.pop("partition_rules", None)
-    return data

@@ -19,7 +19,6 @@ from py_alf.campaign import (
     Ledger,
     SegmentPolicy,
     chain_id,
-    chain_point,
     run_segment,
 )
 from py_alf.campaign.campaign import Campaign, ChainStatus
@@ -149,38 +148,6 @@ def test_loading_a_missing_ledger_is_a_clean_error(tmp_path):
         Ledger.load(tmp_path / "absent.json")
 
 
-def test_chain_point_folds_in_legacy_top_level_keys():
-    """Ledgers written before the seed moved into `point` must still read."""
-    legacy = {"sim_dir": "/d", "disorder_seed": 42, "point": {"N": 8}}
-    assert chain_point(legacy) == {"N": 8, "disorder_seed": 42}
-    # A point that already carries the key wins over the legacy copy.
-    both = {"disorder_seed": 42, "point": {"disorder_seed": 7}}
-    assert chain_point(both)["disorder_seed"] == 7
-
-
-def test_by_point_key_indexes_and_tolerates_absent_keys(tmp_path):
-    """A model with no disorder simply has no such key -- that is not an error."""
-    led = _ledger(tmp_path)
-    led.data["chains"] = {
-        "a": {"point": {"disorder_seed": 1}},
-        "b": {"point": {"disorder_seed": 2}},
-        "c": {"point": {"beta": 5.0}},
-    }
-    assert led.by_point_key("disorder_seed") == {1: "a", 2: "b"}
-    assert led.by_point_key("nothing_uses_this") == {}
-    assert led.chain_ids_by_point_key("disorder_seed") == {1: ["a"], 2: ["b"]}
-
-
-def test_chain_ids_by_point_key_keeps_every_chain_sharing_a_value(tmp_path):
-    """A grid reuses seeds across points, so one value maps to several chains."""
-    led = _ledger(tmp_path)
-    led.data["chains"] = {
-        "a": {"point": {"disorder_seed": 1, "N": 8}},
-        "b": {"point": {"disorder_seed": 1, "N": 10}},
-    }
-    assert sorted(led.chain_ids_by_point_key("disorder_seed")[1]) == ["a", "b"]
-
-
 def test_absorb_segment_records_merges_worker_output(tmp_path):
     """Only the node knows what a segment actually did; fold that back in."""
     sim_dir = tmp_path / "sim"
@@ -192,7 +159,7 @@ def test_absorb_segment_records_merges_worker_output(tmp_path):
     led.data["chains"]["a"] = {
         "sim_dir": str(sim_dir),
         "point": {},
-        "segments": [{"index": 0, "job_id": "7_0"}],
+        "segments": [{"job_id": "7_0"}],
     }
     assert led.absorb_segment_records() == 1
     assert led.chains["a"]["segments"][0]["bins_after"] == 40
@@ -292,9 +259,7 @@ def _status_with(tmp_path, bins, segments, slurm_state=None):
 
 
 def test_status_done_when_the_target_is_reached(tmp_path):
-    assert (
-        _status_with(tmp_path, 100, [{"index": 0, "job_id": "1_0"}]).verdict == "done"
-    )
+    assert _status_with(tmp_path, 100, [{"job_id": "1_0"}]).verdict == "done"
 
 
 def test_status_unstarted_when_nothing_was_submitted(tmp_path):
@@ -303,7 +268,7 @@ def test_status_unstarted_when_nothing_was_submitted(tmp_path):
 
 def test_status_resumable_when_short_with_bins_on_disk(tmp_path):
     """A stopped chain holding bins is a restart, whatever SLURM called it."""
-    got = _status_with(tmp_path, 40, [{"index": 0, "job_id": "1_0"}], "FAILED")
+    got = _status_with(tmp_path, 40, [{"job_id": "1_0"}], "FAILED")
     assert got.verdict == "resumable"
 
 
@@ -313,12 +278,12 @@ def test_status_suspect_when_short_with_no_bins(tmp_path):
     Its SLURM state is the same FAILED a wall-clock stop produces, which is
     exactly why the bin count and not the state decides.
     """
-    got = _status_with(tmp_path, 0, [{"index": 0, "job_id": "1_0"}], "FAILED")
+    got = _status_with(tmp_path, 0, [{"job_id": "1_0"}], "FAILED")
     assert got.verdict == "suspect"
 
 
 def test_status_active_is_left_alone(tmp_path):
-    got = _status_with(tmp_path, 10, [{"index": 0, "job_id": "1_0"}], "RUNNING")
+    got = _status_with(tmp_path, 10, [{"job_id": "1_0"}], "RUNNING")
     assert got.verdict == "active"
     assert got.active_job == "1_0"
 
@@ -378,7 +343,7 @@ def test_status_re_reads_a_finished_chain_when_asked(tmp_path):
 
 def test_status_trusts_the_worker_record_for_an_idle_chain(tmp_path):
     """Nothing is running, so what the last segment flushed is what is on disk."""
-    segments = [{"index": 0, "job_id": "1_0", "bins_after": 40}]
+    segments = [{"job_id": "1_0", "bins_after": 40}]
     statuses, read = _status_counting_reads(
         tmp_path,
         {"a": _record(str(tmp_path / "sim"), segments)},
@@ -391,7 +356,7 @@ def test_status_trusts_the_worker_record_for_an_idle_chain(tmp_path):
 
 def test_status_reads_a_chain_whose_job_is_still_running(tmp_path):
     """A live job is writing bins the worker has not recorded yet."""
-    segments = [{"index": 0, "job_id": "1_0", "bins_after": 40}]
+    segments = [{"job_id": "1_0", "bins_after": 40}]
     _, read = _status_counting_reads(
         tmp_path,
         {"a": _record(str(tmp_path / "sim"), segments)},
@@ -404,7 +369,7 @@ def test_status_reads_a_chain_whose_worker_left_no_record(tmp_path):
     """A segment killed before it could write one proves nothing about the file."""
     _, read = _status_counting_reads(
         tmp_path,
-        {"a": _record(str(tmp_path / "sim"), [{"index": 0, "job_id": "1_0"}])},
+        {"a": _record(str(tmp_path / "sim"), [{"job_id": "1_0"}])},
         states={"1_0": {"status": "FAILED"}},
     )
     assert read == [str(tmp_path / "sim" / "data.h5")]
@@ -439,8 +404,8 @@ def test_a_racing_read_cannot_walk_the_count_backwards(tmp_path):
 def test_the_worker_record_taken_is_the_highest_one(tmp_path):
     """A requeued attempt that crashed early records fewer bins than it found."""
     segments = [
-        {"index": 0, "job_id": "1_0", "bins_after": 40},
-        {"index": 1, "job_id": "1_0", "bins_after": 12},
+        {"job_id": "1_0", "bins_after": 40},
+        {"job_id": "1_0", "bins_after": 12},
     ]
     statuses, read = _status_counting_reads(
         tmp_path,
@@ -465,12 +430,12 @@ def _chain_on_disk(tmp_path, name, bins, job_id, worker_bins=None):
         f.create_dataset("Ener_scal/obser", data=np.zeros((bins, 1)))
     if worker_bins is not None:
         (d / "segments" / "s0.json").write_text(
-            json.dumps({"job_id": job_id, "index": 0, "bins_after": worker_bins})
+            json.dumps({"job_id": job_id, "bins_after": worker_bins})
         )
     return {
         "sim_dir": str(d),
         "point": {},
-        "segments": [{"index": 0, "job_id": job_id}],
+        "segments": [{"job_id": job_id}],
     }
 
 
@@ -617,7 +582,7 @@ def test_a_chain_that_ran_since_the_count_was_cached_is_re_read(tmp_path):
     not merely the fact that the chain was idle.
     """
     record = _chain_on_disk(tmp_path, "ran", 40, "1_0")
-    record["segments"].append({"index": 1, "job_id": "1_1"})
+    record["segments"].append({"job_id": "1_1"})
     record.update(bins=40, bins_segments=1)
     _, read = _status_counting_reads(
         tmp_path,
@@ -815,10 +780,17 @@ def _launch_campaign(tmp_path, chains, **kwargs):
         ledger_path=tmp_path / "c.json",
         partition_rules=RULES,
         # Pin the cost so a budget is a function of the bins alone.
-        hours_per_bin=dict.fromkeys({c.array_key for c in chains}, 0.1),
+        cost_model=lambda sim_dict: 0.1,
         **kwargs,
     )
     return camp, submitter
+
+
+def test_launching_an_empty_grid_is_a_clean_error(tmp_path):
+    camp, sub = _launch_campaign(tmp_path, [])
+    with pytest.raises(SystemExit):
+        camp.launch(verbose=False)
+    assert sub.calls == []
 
 
 def test_launch_submits_only_the_chains_short_of_the_target(tmp_path):
@@ -910,7 +882,7 @@ def _reconcile_campaign(tmp_path, specs, **kwargs):
         segments = []
         if state is not None:
             job_id = f"900_{i}"
-            segments = [{"index": 0, "job_id": job_id}]
+            segments = [{"job_id": job_id}]
             states[job_id] = {"status": state}
         led.data["chains"][name] = {
             "sim_dir": str(tmp_path / name),
