@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -14,7 +15,14 @@ from ..alf_source import ALF_source
 from ..bins import read_bin_counts
 from ..cluster_submission import ClusterSubmitter
 from ..simulation import Simulation
-from ..slurm import ACTIVE_STATES, cancel, is_timeout, job_log, job_states
+from ..slurm import (
+    ACTIVE_STATES,
+    cancel,
+    is_timeout,
+    job_log,
+    job_states,
+    queued_arrays,
+)
 from .chain import Chain
 from .ledger import DEFAULT_COUNTING_OBS, Ledger
 from .policy import SegmentPolicy
@@ -170,14 +178,14 @@ class Campaign:
         segments: int | None = None,
         dry_run: bool = False,
         verbose: bool = True,
-        bins: dict[str, int] | None = None,
+        known_bins: dict[str, int] | None = None,
     ) -> Ledger:
         """Queue the campaign: one SLURM array per group of chains.
 
         ``segments`` is the number of *attempts* a task may make: the first run
         plus the requeues submitit is allowed to perform. Chains that are
         already complete, or that still have an active job, are left alone -- so
-        relaunching a campaign tops up only what needs it. ``bins`` holds counts
+        relaunching a campaign tops up only what needs it. ``known_bins`` holds counts
         already resolved by :meth:`status`, by chain id; other chains are read.
         """
         if not self.chains:
@@ -197,7 +205,7 @@ class Campaign:
         rules = self.submitter.partition_rules or {}
         for key, chains in self.groups().items():
             idle = [c for c in chains if c.chain_id not in active]
-            runnable = self._runnable(idle, bins or {})
+            runnable = self._runnable(idle, known_bins or {})
             if not runnable:
                 if verbose:
                     print(f"[{key or self.name}] nothing to submit.")
@@ -245,6 +253,10 @@ class Campaign:
         if self.submitter.executor != "slurm" or not jobs:
             return set()
         states = job_states(jobs)
+        if any((states.get(j) or {}).get("status") == "ERROR" for j in jobs):
+            raise RuntimeError(
+                "SLURM did not answer, so it is unknown which jobs are live"
+            )
         return {j for j in jobs if (states.get(j) or {}).get("status") in ACTIVE_STATES}
 
     def _active_chain_ids(self, ledger: Ledger) -> set[str]:
@@ -334,6 +346,9 @@ class Campaign:
                     "cpu_max_planned": float(ceiling),
                 },
             )
+        # Saved per array: a later array failing must not leave this one
+        # live but unrecorded, where a relaunch would submit it again.
+        ledger.save()
         if verbose:
             print(f"    array {jobs[0].job_id.split('_')[0]}")
 
@@ -530,7 +545,7 @@ class Campaign:
         subset.launch(
             segments=segments,
             verbose=verbose,
-            bins={s.chain_id: s.bins for s in statuses},
+            known_bins={s.chain_id: s.bins for s in statuses},
         )
         return statuses
 
@@ -545,10 +560,34 @@ class Campaign:
         folder = self.job_folder(record.get("array_key", ""), jobs[-1])
         return job_log(jobs[-1], folder, stream)
 
+    def _queued_arrays(self) -> set[str]:
+        """This user's array ids SLURM still holds; raises if squeue fails."""
+        if self.submitter.executor != "slurm":
+            return set()
+        try:
+            return queued_arrays()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(
+                f"squeue failed, so no job can be ruled out: {exc}"
+            ) from exc
+
+    def _array_folders(self) -> list[Path]:
+        if self.jobs_dir is None or not self.jobs_dir.is_dir():
+            return []
+        return sorted(p for p in self.jobs_dir.glob("*/*") if p.is_dir())
+
     def cancel(self, dry_run: bool = False) -> list[str]:
-        """Cancel every array with a live job of this campaign; return their ids."""
-        live = self._live_jobs(Ledger.load(self.ledger_path).chains)
-        arrays = sorted({job.split("_")[0] for job in live})
+        """Cancel every array of this campaign SLURM still holds; return their ids.
+
+        Arrays are known from the ledger and from the job folders, so one the
+        ledger never recorded is cancelled too.
+        """
+        chains = Ledger.load(self.ledger_path).chains
+        ours = {
+            j.split("_")[0] for record in chains.values() for j in _segment_jobs(record)
+        }
+        ours |= {folder.name for folder in self._array_folders()}
+        arrays = sorted(self._queued_arrays() & ours)
         if arrays and not dry_run:
             cancel(arrays)
         return arrays
@@ -558,24 +597,22 @@ class Campaign:
 
         An array folder no chain's latest segment points to goes entirely. One
         that is still pointed to keeps its log, which timeout detection reads,
-        and loses submitit's pickles. Folders of live jobs are left alone.
+        and loses submitit's pickles. A folder whose array SLURM still holds is
+        left alone, recorded in the ledger or not.
         """
-        if self.jobs_dir is None or not self.jobs_dir.is_dir():
+        folders = self._array_folders()
+        if not folders:
             return []
-        chains = Ledger.load(self.ledger_path).chains
-        live = self._live_jobs(chains)
-        latest: set[Path] = set()
-        busy: set[Path] = set()
-        for record in chains.values():
-            jobs = _segment_jobs(record)
-            key = record.get("array_key", "")
-            if jobs:
-                latest.add(self.job_folder(key, jobs[-1]))
-            busy |= {self.job_folder(key, j) for j in jobs if j in live}
+        queued = self._queued_arrays()
+        latest = {
+            self.job_folder(record.get("array_key", ""), jobs[-1])
+            for record in Ledger.load(self.ledger_path).chains.values()
+            if (jobs := _segment_jobs(record))
+        }
 
         removed: list[Path] = []
-        for folder in sorted(p for p in self.jobs_dir.glob("*/*") if p.is_dir()):
-            if folder in busy:
+        for folder in folders:
+            if folder.name in queued:
                 continue
             if folder not in latest:
                 removed.append(folder)

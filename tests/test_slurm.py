@@ -1,11 +1,12 @@
 """Tests for SLURM job state, timeout detection and logs in py_alf.slurm."""
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from py_alf.slurm import _sanitise_nodelist, is_timeout, job_log
+from py_alf.slurm import _sanitise_nodelist, is_timeout, job_log, queued_arrays
 
 
 @pytest.fixture(autouse=True)
@@ -216,3 +217,23 @@ def test_sanitise_nodelist_rejects_sacct_none_literal():
 def test_sanitise_nodelist_rejects_empty_and_none():
     assert _sanitise_nodelist("") is None
     assert _sanitise_nodelist(None) is None
+
+
+# --- queued_arrays ---
+
+
+def test_queued_arrays_reads_squeue_array_ids():
+    result = MagicMock(stdout="4811203\n4811203\n77\n\n")
+    with patch("py_alf.slurm.subprocess.run", return_value=result) as run:
+        assert queued_arrays() == {"4811203", "77"}
+    assert run.call_args.kwargs["check"] is True
+
+
+def test_queued_arrays_raises_when_squeue_fails():
+    """An unanswered query must never read as an empty queue."""
+    failure = subprocess.CalledProcessError(1, "squeue")
+    with (
+        patch("py_alf.slurm.subprocess.run", side_effect=failure),
+        pytest.raises(subprocess.CalledProcessError),
+    ):
+        queued_arrays()

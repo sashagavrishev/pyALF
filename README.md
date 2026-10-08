@@ -84,6 +84,6 @@ Under submitit a wall-clock stop is recorded as `FAILED` or `CANCELLED`, never `
 |---|---|
 | `cluster_submission` | `ClusterSubmitter`, `PartitionSpec` |
 | `campaign` | `Campaign`, `Chain`, `ChainStatus`, `Ledger`, `SegmentPolicy`, `chain_id`, `ledger_path` |
-| `slurm` | `job_states`, `is_timeout`, `job_log`, `cancel`, `ACTIVE_STATES`, `TERMINAL_STATES` |
+| `slurm` | `job_states`, `queued_arrays`, `is_timeout`, `job_log`, `cancel`, `ACTIVE_STATES`, `TERMINAL_STATES` |
 | `bins` | `read_bin_count`, `read_bin_counts` |
 | `execute` | `exec_alf_binary`, the one place ALF is started |

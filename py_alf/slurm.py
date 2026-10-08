@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import getpass
 import logging
 import subprocess
 from pathlib import Path
@@ -281,3 +282,19 @@ def job_log(jobid: str, folder: str | Path, stream: str = "out") -> Path:
 def cancel(job_ids: list[str]) -> None:
     """``scancel`` the given jobs or whole arrays."""
     subprocess.run(["scancel", *job_ids], check=True)
+
+
+def queued_arrays() -> set[str]:
+    """Array ids (job ids for single jobs) of this user's jobs SLURM still holds.
+
+    Raises if ``squeue`` fails, so an unanswered query is never read as an
+    empty queue.
+    """
+    result = subprocess.run(
+        ["squeue", "-h", "-u", getpass.getuser(), "-o", "%F"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}

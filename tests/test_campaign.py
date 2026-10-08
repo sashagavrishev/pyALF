@@ -7,6 +7,7 @@ consuming project's integration tests.
 """
 
 import json
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -688,41 +689,110 @@ def test_log_path_is_the_latest_segments_log(tmp_path):
     assert camp.log_path("b") is None
 
 
-def test_cancel_cancels_each_live_array_once(tmp_path):
+def test_cancel_cancels_each_queued_array_of_the_campaign(tmp_path):
+    """Arrays come from the ledger and the job folders; others' jobs are not ours."""
     camp = _housekeeping_campaign(
         tmp_path, {"a": ["701_0"], "b": ["701_1"], "c": ["700_0"]}
     )
-    states = {
-        "701_0": {"status": "RUNNING"},
-        "701_1": {"status": "PENDING"},
-        "700_0": {"status": "COMPLETED"},
-    }
+    (tmp_path / "jobs" / "k" / "705").mkdir()  # submitted, never recorded
+    queued = {"701", "705", "999"}  # 999 belongs to someone else's work
     with (
-        patch("py_alf.campaign.campaign.job_states", return_value=states),
+        patch("py_alf.campaign.campaign.queued_arrays", return_value=queued),
         patch("py_alf.campaign.campaign.cancel") as scancel,
     ):
-        assert camp.cancel(dry_run=True) == ["701"]
+        assert camp.cancel(dry_run=True) == ["701", "705"]
         scancel.assert_not_called()
-        assert camp.cancel() == ["701"]
-    scancel.assert_called_once_with(["701"])
+        assert camp.cancel() == ["701", "705"]
+    scancel.assert_called_once_with(["701", "705"])
 
 
 def test_prune_keeps_what_is_still_read(tmp_path):
-    """Superseded arrays go; the latest keeps its log; a live array is untouched."""
+    """Superseded arrays go; the latest keeps its log; a queued array is untouched."""
     camp = _housekeeping_campaign(
         tmp_path, {"a": ["801_0", "802_0"], "b": ["803_0"], "c": ["804_0"]}
     )
-    states = {"803_0": {"status": "RUNNING"}, "802_0": {"status": "FAILED"}}
     jobs = tmp_path / "jobs" / "k"
-    with patch("py_alf.campaign.campaign.job_states", return_value=states):
+    with patch("py_alf.campaign.campaign.queued_arrays", return_value={"803"}):
         planned = camp.prune(dry_run=True)
         assert (jobs / "801").exists()
         assert camp.prune() == planned
 
     assert not (jobs / "801").exists()  # superseded by 802 for chain a
     assert sorted(p.name for p in (jobs / "802").iterdir()) == ["802_0_0_log.out"]
-    assert (jobs / "803" / "803_0_submitted.pkl").exists()  # live
+    assert (jobs / "803" / "803_0_submitted.pkl").exists()  # queued
     assert sorted(p.name for p in (jobs / "804").iterdir()) == ["804_0_0_log.out"]
+
+
+def test_prune_spares_a_queued_array_the_ledger_never_recorded(tmp_path):
+    """A launch that failed partway can leave a live array out of the ledger."""
+    camp = _housekeeping_campaign(tmp_path, {"a": ["901_0"]})
+    unrecorded = tmp_path / "jobs" / "k" / "902"
+    unrecorded.mkdir()
+    (unrecorded / "902_0_submitted.pkl").write_text("pickle")
+    with patch("py_alf.campaign.campaign.queued_arrays", return_value={"902"}):
+        camp.prune()
+    assert (unrecorded / "902_0_submitted.pkl").exists()
+
+
+def test_prune_refuses_when_squeue_fails(tmp_path):
+    """An unanswered query must not read as an empty queue."""
+    camp = _housekeeping_campaign(tmp_path, {"a": ["911_0", "912_0"]})
+    failure = subprocess.CalledProcessError(1, "squeue")
+    with (
+        patch("py_alf.campaign.campaign.queued_arrays", side_effect=failure),
+        pytest.raises(RuntimeError, match="squeue failed"),
+    ):
+        camp.prune()
+    assert (tmp_path / "jobs" / "k" / "911").exists()
+
+
+def test_launch_refuses_when_slurm_does_not_answer(tmp_path):
+    """Treating an ERROR state as idle would submit a running chain again."""
+    camp, sub = _launch_campaign(tmp_path, [_chain(tmp_path, "a", 0)], executor="slurm")
+    camp.launch(verbose=False)
+    with (
+        patch(
+            "py_alf.campaign.campaign.job_states",
+            return_value={"1001_0": {"status": "ERROR"}},
+        ),
+        pytest.raises(RuntimeError, match="did not answer"),
+    ):
+        camp.launch(verbose=False)
+    assert len(sub.calls) == 1
+
+
+def test_launch_records_each_array_before_submitting_the_next(tmp_path):
+    """A failure on a later array must leave the earlier ones in the ledger."""
+    chains = [
+        _chain(tmp_path, "a", 0, array_key="k1"),
+        _chain(tmp_path, "b", 0, array_key="k2"),
+    ]
+    camp, sub = _launch_campaign(tmp_path, chains)
+    real_submit = sub.submit
+
+    def submit_then_fail(sims, job_properties, **kwargs):
+        if sub.calls:
+            raise RuntimeError("sbatch: error")
+        return real_submit(sims, job_properties, **kwargs)
+
+    sub.submit = submit_then_fail
+    with pytest.raises(RuntimeError, match="sbatch"):
+        camp.launch(verbose=False)
+
+    ledger = Ledger.load(tmp_path / "c.json")
+    assert len(ledger.chains["a"]["segments"]) == 1
+
+
+def test_dry_run_survives_arrays_that_already_hold_bins(tmp_path):
+    """The dry-run listing once overwrote launch's own known-bins argument."""
+    chains = [
+        _chain(tmp_path, "a", 20, array_key="k1"),
+        _chain(tmp_path, "b", 30, array_key="k2"),
+    ]
+    camp, sub = _launch_campaign(tmp_path, chains)
+    camp.launch(dry_run=True, verbose=False, known_bins={"a": 20, "b": 30})
+    camp.launch(dry_run=True, verbose=False)
+    assert sub.calls == []
 
 
 def test_prune_without_jobs_dir_touches_nothing(tmp_path):
