@@ -656,6 +656,80 @@ def test_without_jobs_dir_files_stay_in_the_submitters_folder(tmp_path):
     assert camp.job_folder("k", "1001_0") == tmp_path / "submit"
 
 
+# --- housekeeping: log_path, cancel, prune -----------------------------------
+
+
+def _housekeeping_campaign(tmp_path, segments_by_chain, executor="slurm"):
+    """A campaign under jobs_dir whose chains ran the given segments in array k."""
+    led = _ledger(tmp_path)
+    for cid, jobs in segments_by_chain.items():
+        led.data["chains"][cid] = {
+            "sim_dir": str(tmp_path / cid),
+            "point": {},
+            "array_key": "k",
+            "segments": [{"job_id": j} for j in jobs],
+        }
+        for j in jobs:
+            folder = tmp_path / "jobs" / "k" / j.split("_")[0]
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / f"{j}_0_log.out").write_text("log")
+            (folder / f"{j}_submitted.pkl").write_text("pickle")
+    led.save()
+    camp = _campaign(tmp_path)
+    camp.submitter.executor = executor
+    camp.jobs_dir = tmp_path / "jobs"
+    return camp
+
+
+def test_log_path_is_the_latest_segments_log(tmp_path):
+    camp = _housekeeping_campaign(tmp_path, {"a": ["601_0", "602_3"], "b": []})
+    assert camp.log_path("a") == tmp_path / "jobs" / "k" / "602" / "602_3_0_log.out"
+    assert camp.log_path("a", "err").name == "602_3_0_log.err"
+    assert camp.log_path("b") is None
+
+
+def test_cancel_cancels_each_live_array_once(tmp_path):
+    camp = _housekeeping_campaign(
+        tmp_path, {"a": ["701_0"], "b": ["701_1"], "c": ["700_0"]}
+    )
+    states = {
+        "701_0": {"status": "RUNNING"},
+        "701_1": {"status": "PENDING"},
+        "700_0": {"status": "COMPLETED"},
+    }
+    with (
+        patch("py_alf.campaign.campaign.job_states", return_value=states),
+        patch("py_alf.campaign.campaign.cancel") as scancel,
+    ):
+        assert camp.cancel(dry_run=True) == ["701"]
+        scancel.assert_not_called()
+        assert camp.cancel() == ["701"]
+    scancel.assert_called_once_with(["701"])
+
+
+def test_prune_keeps_what_is_still_read(tmp_path):
+    """Superseded arrays go; the latest keeps its log; a live array is untouched."""
+    camp = _housekeeping_campaign(
+        tmp_path, {"a": ["801_0", "802_0"], "b": ["803_0"], "c": ["804_0"]}
+    )
+    states = {"803_0": {"status": "RUNNING"}, "802_0": {"status": "FAILED"}}
+    jobs = tmp_path / "jobs" / "k"
+    with patch("py_alf.campaign.campaign.job_states", return_value=states):
+        planned = camp.prune(dry_run=True)
+        assert (jobs / "801").exists()
+        assert camp.prune() == planned
+
+    assert not (jobs / "801").exists()  # superseded by 802 for chain a
+    assert sorted(p.name for p in (jobs / "802").iterdir()) == ["802_0_0_log.out"]
+    assert (jobs / "803" / "803_0_submitted.pkl").exists()  # live
+    assert sorted(p.name for p in (jobs / "804").iterdir()) == ["804_0_0_log.out"]
+
+
+def test_prune_without_jobs_dir_touches_nothing(tmp_path):
+    camp = _campaign(tmp_path)
+    assert camp.prune() == []
+
+
 # --- the progress hook -------------------------------------------------------
 
 

@@ -276,3 +276,8 @@ def job_log(jobid: str, folder: str | Path, stream: str = "out") -> Path:
     """
     paths = JobPaths(folder, job_id=jobid)
     return paths.stdout if stream == "out" else paths.stderr
+
+
+def cancel(job_ids: list[str]) -> None:
+    """``scancel`` the given jobs or whole arrays."""
+    subprocess.run(["scancel", *job_ids], check=True)

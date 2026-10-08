@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -13,7 +14,7 @@ from ..alf_source import ALF_source
 from ..bins import read_bin_counts
 from ..cluster_submission import ClusterSubmitter
 from ..simulation import Simulation
-from ..slurm import ACTIVE_STATES, is_timeout, job_states
+from ..slurm import ACTIVE_STATES, cancel, is_timeout, job_log, job_states
 from .chain import Chain
 from .ledger import DEFAULT_COUNTING_OBS, Ledger
 from .policy import SegmentPolicy
@@ -238,22 +239,20 @@ class Campaign:
                 print(f"Ledger: {ledger.path}")
         return ledger
 
-    def _active_chain_ids(self, ledger: Ledger) -> set[str]:
-        """Chains with a segment SLURM still holds, from one bulk query."""
-        if self.submitter.executor != "slurm":
-            return set()
-        records = {c.chain_id: ledger.chains[c.chain_id] for c in self.chains}
-        jobs = [
-            s["job_id"]
-            for record in records.values()
-            for s in record.get("segments", [])
-            if s.get("job_id")
-        ]
-        if not jobs:
+    def _live_jobs(self, records: dict[str, dict[str, Any]]) -> set[str]:
+        """Segment job ids SLURM still holds, from one bulk query."""
+        jobs = [j for record in records.values() for j in _segment_jobs(record)]
+        if self.submitter.executor != "slurm" or not jobs:
             return set()
         states = job_states(jobs)
+        return {j for j in jobs if (states.get(j) or {}).get("status") in ACTIVE_STATES}
+
+    def _active_chain_ids(self, ledger: Ledger) -> set[str]:
+        """This campaign's chains with a segment SLURM still holds."""
+        records = {c.chain_id: ledger.chains[c.chain_id] for c in self.chains}
+        live = self._live_jobs(records)
         return {
-            cid for cid, record in records.items() if _has_active_job(record, states)
+            cid for cid, record in records.items() if live & set(_segment_jobs(record))
         }
 
     def _runnable(
@@ -534,6 +533,65 @@ class Campaign:
             bins={s.chain_id: s.bins for s in statuses},
         )
         return statuses
+
+    # --- housekeeping -------------------------------------------------------
+
+    def log_path(self, chain_id: str, stream: str = "out") -> Path | None:
+        """submitit's log of the chain's latest segment; None before its first."""
+        record = Ledger.load(self.ledger_path).chains[chain_id]
+        jobs = _segment_jobs(record)
+        if not jobs:
+            return None
+        folder = self.job_folder(record.get("array_key", ""), jobs[-1])
+        return job_log(jobs[-1], folder, stream)
+
+    def cancel(self, dry_run: bool = False) -> list[str]:
+        """Cancel every array with a live job of this campaign; return their ids."""
+        live = self._live_jobs(Ledger.load(self.ledger_path).chains)
+        arrays = sorted({job.split("_")[0] for job in live})
+        if arrays and not dry_run:
+            cancel(arrays)
+        return arrays
+
+    def prune(self, dry_run: bool = False) -> list[Path]:
+        """Delete job files nothing reads any more; return what goes.
+
+        An array folder no chain's latest segment points to goes entirely. One
+        that is still pointed to keeps its log, which timeout detection reads,
+        and loses submitit's pickles. Folders of live jobs are left alone.
+        """
+        if self.jobs_dir is None or not self.jobs_dir.is_dir():
+            return []
+        chains = Ledger.load(self.ledger_path).chains
+        live = self._live_jobs(chains)
+        latest: set[Path] = set()
+        busy: set[Path] = set()
+        for record in chains.values():
+            jobs = _segment_jobs(record)
+            key = record.get("array_key", "")
+            if jobs:
+                latest.add(self.job_folder(key, jobs[-1]))
+            busy |= {self.job_folder(key, j) for j in jobs if j in live}
+
+        removed: list[Path] = []
+        for folder in sorted(p for p in self.jobs_dir.glob("*/*") if p.is_dir()):
+            if folder in busy:
+                continue
+            if folder not in latest:
+                removed.append(folder)
+                if not dry_run:
+                    shutil.rmtree(folder)
+                continue
+            for pickle in sorted(folder.glob("*.pkl")):
+                removed.append(pickle)
+                if not dry_run:
+                    pickle.unlink()
+        return removed
+
+
+def _segment_jobs(record: dict[str, Any]) -> list[str]:
+    """Job ids of a chain's segments, oldest first."""
+    return [s["job_id"] for s in record.get("segments", []) if s.get("job_id")]
 
 
 def _has_active_job(record: dict[str, Any], states: dict[str, dict]) -> bool:

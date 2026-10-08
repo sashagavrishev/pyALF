@@ -52,6 +52,9 @@ campaign = Campaign(
 campaign.launch()                       # one array per array_key
 campaign.status()                       # per-chain bins and verdict
 campaign.reconcile()                    # resubmit what stalled
+campaign.log_path(chain_id)             # submitit log of a chain's latest segment
+campaign.cancel()                       # scancel every live array
+campaign.prune()                        # drop superseded job folders and pickles
 Campaign.from_ledger(ledger_path(data_dir, "default"), cs).status()   # from a fresh shell
 ```
 
@@ -81,6 +84,6 @@ Under submitit a wall-clock stop is recorded as `FAILED` or `CANCELLED`, never `
 |---|---|
 | `cluster_submission` | `ClusterSubmitter`, `PartitionSpec` |
 | `campaign` | `Campaign`, `Chain`, `ChainStatus`, `Ledger`, `SegmentPolicy`, `chain_id`, `ledger_path` |
-| `slurm` | `job_states`, `is_timeout`, `job_log`, `ACTIVE_STATES`, `TERMINAL_STATES` |
+| `slurm` | `job_states`, `is_timeout`, `job_log`, `cancel`, `ACTIVE_STATES`, `TERMINAL_STATES` |
 | `bins` | `read_bin_count`, `read_bin_counts` |
 | `execute` | `exec_alf_binary`, the one place ALF is started |
