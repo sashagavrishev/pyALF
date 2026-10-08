@@ -35,53 +35,24 @@ def _check_fresh_start(sim_dir: Path) -> None:
     data_file.unlink()
 
 
-def exec_alf_binary(
-    sim_dir: str | Path,
-    n_omp: int,
-    n_mpi: int,
-    mpi: bool,
-    mpiexec: str = "mpiexec",
-    mpiexec_args: list[str] | None = None,
-    config: str = "",
-    alf_dir: str = ".",
-    extra_env: dict[str, str] | None = None,
-) -> None:
-    """Execute the ALF binary already present in *sim_dir*.
+def exec_alf_binary(sim: Simulation, executable: str | Path | None = None) -> None:
+    """Run ALF for *sim* inside its ``sim_dir``, with ``sim.env`` applied.
 
-    Single source of truth for how an ALF job is launched on a worker node.
+    The one place an ALF process is started, locally or on a node.
+    *executable* defaults to the copy of ``ALF.out`` in ``sim_dir``.
     """
-    sim_dir_path = Path(sim_dir)
-    _check_fresh_start(sim_dir_path)
-    executable = os.path.join(str(sim_dir), "ALF.out")
-    env = getenv(config, alf_dir)
+    sim_dir = Path(sim.sim_dir)
+    _check_fresh_start(sim_dir)
+    env = getenv(sim.config, sim.alf_src.alf_dir)
     # Prefer SLURM_CPUS_PER_TASK so OMP_NUM_THREADS exactly matches the
     # allocated CPU slots, which is best practice for hybrid MPI+OpenMP jobs.
-    env["OMP_NUM_THREADS"] = os.environ.get("SLURM_CPUS_PER_TASK", str(n_omp))
-    env.update(extra_env or {})
+    env["OMP_NUM_THREADS"] = os.environ.get("SLURM_CPUS_PER_TASK", str(sim.n_omp))
+    env.update(sim.env)
 
-    if mpi:
-        cmd: list[str] = [mpiexec, "-n", str(n_mpi), *(mpiexec_args or []), executable]
+    binary = str(executable) if executable is not None else str(sim_dir / "ALF.out")
+    if sim.mpi:
+        cmd = [sim.mpiexec, "-n", str(sim.n_mpi), *sim.mpiexec_args, binary]
     else:
-        cmd = [executable]
+        cmd = [binary]
     with cd(str(sim_dir)):
         subprocess.run(cmd, check=True, env=env)
-
-
-def run_alf(sim: Simulation) -> None:
-    """
-    Execute an ALF simulation on a cluster node.
-
-    Called by submitit on the remote worker. Assumes the binary has already been copied
-    into sim.sim_dir by the pre-submission preparation step.
-    """
-    exec_alf_binary(
-        sim.sim_dir,
-        sim.n_omp,
-        sim.n_mpi,
-        getattr(sim, "mpi", False),
-        mpiexec=getattr(sim, "mpiexec", "mpiexec"),
-        mpiexec_args=getattr(sim, "mpiexec_args", []),
-        config=getattr(sim, "config", ""),
-        alf_dir=getattr(sim.alf_src, "alf_dir", "."),
-        extra_env=getattr(sim, "env", None),
-    )

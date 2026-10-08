@@ -11,7 +11,7 @@ from py_alf.cluster_submission import (
     _parse_mem_gb,
     _parse_slurm_time_hours,
 )
-from py_alf.execute import run_alf
+from py_alf.execute import exec_alf_binary
 from py_alf.simulation import Simulation
 
 _RULES = {"short": 8, "long": 168}
@@ -173,7 +173,7 @@ def test_submit_single_sim(tmp_path):
 
     assert jobs == [mock_job]
     assert (tmp_path / "sim0" / "jobid.txt").read_text() == "42"
-    mock_executor.return_value.submit.assert_called_once_with(run_alf, sim)
+    mock_executor.return_value.submit.assert_called_once_with(exec_alf_binary, sim)
 
 
 def test_submit_multiple_sims_uses_map_array(tmp_path):
@@ -191,7 +191,7 @@ def test_submit_multiple_sims_uses_map_array(tmp_path):
     assert jobs == mock_jobs
     for i, _sim in enumerate(sims):
         assert (tmp_path / f"sim{i}" / "jobid.txt").read_text() == f"99_{i}"
-    mock_executor.return_value.map_array.assert_called_once_with(run_alf, sims)
+    mock_executor.return_value.map_array.assert_called_once_with(exec_alf_binary, sims)
 
 
 def test_submit_heterogeneous_resources_raises(tmp_path):

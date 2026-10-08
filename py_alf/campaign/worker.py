@@ -158,17 +158,7 @@ def run_segment(sim) -> None:
     started = time.time()
     sim.run(only_prep=True)
     _claim_running(sim_dir, job_id)
-    exec_alf_binary(
-        sim.sim_dir,
-        sim.n_omp,
-        sim.n_mpi,
-        getattr(sim, "mpi", False),
-        mpiexec=getattr(sim, "mpiexec", "mpiexec"),
-        mpiexec_args=getattr(sim, "mpiexec_args", []),
-        config=getattr(sim, "config", ""),
-        alf_dir=getattr(sim.alf_src, "alf_dir", "."),
-        extra_env=getattr(sim, "env", None),
-    )
+    exec_alf_binary(sim)
     elapsed = time.time() - started
 
     bins_after = _count_bins(sim, plan.counting_obs)

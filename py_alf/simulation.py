@@ -248,28 +248,14 @@ class Simulation:
             executable = os.path.join(self.sim_dir, "ALF.out")
         if only_prep:
             return
-        env = getenv(self.config, self.alf_src.alf_dir)
-        env["OMP_NUM_THREADS"] = str(self.n_omp)
-        with cd(self.sim_dir):
-            print(f"Run {executable}")
-            try:
-                if self.mpi:
-                    command = [
-                        self.mpiexec,
-                        "-n",
-                        str(self.n_mpi),
-                        *self.mpiexec_args,
-                        executable,
-                    ]
-                else:
-                    command = executable
-                subprocess.run(command, check=True, env=env)
-            except subprocess.CalledProcessError as ALF_crash:
-                print(f"Error while running {executable}.")
-                print("parameters:")
-                # with open('parameters', 'r') as f:
-                #     print(f.read())
-                raise RuntimeError(f"Error while running {executable}.") from ALF_crash
+        # Imported here because execute imports this module.
+        from .execute import exec_alf_binary
+
+        print(f"Run {executable}")
+        try:
+            exec_alf_binary(self, executable)
+        except subprocess.CalledProcessError as ALF_crash:
+            raise RuntimeError(f"Error while running {executable}.") from ALF_crash
 
     def get_directories(self):
         """Return list of directories connected to this simulation."""

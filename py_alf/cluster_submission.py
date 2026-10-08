@@ -22,7 +22,7 @@ from typing import Any, Literal, TypedDict
 
 import submitit
 
-from .execute import run_alf
+from .execute import exec_alf_binary
 from .simulation import Simulation
 from .slurm import job_state
 
@@ -435,7 +435,7 @@ class ClusterSubmitter:
             Overrides the instance-level ``submit_dir`` set at construction.
         runner : callable, optional
             Function submitit executes on the worker, called with one
-            ``Simulation``. Defaults to :func:`run_alf`, which execs the binary
+            ``Simulation``. Defaults to :func:`~py_alf.execute.exec_alf_binary`, which execs the binary
             directly. A caller that must decide *on the node* how to run (e.g.
             sizing ``CPU_MAX`` from the bins already on disk) passes its own,
             usually together with ``prep=False``.
@@ -657,7 +657,7 @@ class ClusterSubmitter:
         )
         executor.update_parameters(**params)
 
-        run_fn = runner if runner is not None else run_alf
+        run_fn = runner if runner is not None else exec_alf_binary
         if len(filtered_sims) == 1:
             jobs = [executor.submit(run_fn, filtered_sims[0])]
         else:
