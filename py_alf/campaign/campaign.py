@@ -35,23 +35,16 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from .._io import map_io
 from ..alf_source import ALF_source
-from ..cluster_submission import (
-    ClusterSubmitter,
-    _bin_cache,
-    _bin_counts,
-    _get_slurm_status_bulk,
-    _is_submitit_timeout,
-    _map_io,
-)
+from ..bins import _bin_cache, read_bin_counts
+from ..cluster_submission import ClusterSubmitter
 from ..simulation import Simulation
+from ..slurm import ACTIVE_STATES, is_timeout, job_states
 from .chain import Chain
 from .ledger import DEFAULT_COUNTING_OBS, Ledger
 from .policy import SegmentPolicy
 from .worker import SegmentPlan, measured_hours_per_bin, run_segment
-
-# Job states meaning "this chain is still being worked on, leave it alone".
-ACTIVE_STATES = frozenset({"PENDING", "RUNNING", "REQUEUED", "SUSPENDED", "COMPLETING"})
 
 # Reports progress out of a long scan: ``(n_settled, phase)``. A campaign can
 # hold tens of thousands of chains, so a caller driving one from a terminal
@@ -288,7 +281,7 @@ class Campaign:
         array's budget needs the same number, and re-reading the whole grid to
         get it would double the launch's filesystem cost.
         """
-        bins = _bin_counts(
+        bins = read_bin_counts(
             [os.path.join(c.sim_dir, "data.h5") for c in chains], self.counting_obs
         )
         return [
@@ -425,7 +418,7 @@ class Campaign:
             on_progress(len(known), "cached")
 
         if needs_read:
-            counts = _bin_counts(
+            counts = read_bin_counts(
                 [
                     str(Path(ledger.chains[cid]["sim_dir"]) / "data.h5")
                     for cid in needs_read
@@ -486,7 +479,7 @@ class Campaign:
         ]
         if on_progress is not None and all_jobs:
             on_progress(0, "slurm")
-        states = _get_slurm_status_bulk(all_jobs) if all_jobs else {}
+        states = job_states(all_jobs) if all_jobs else {}
         submit_dir = self.submitter.submit_dir
         bins_by_id = self._resolve_bins(
             ledger, states, deep=deep, on_progress=on_progress
@@ -521,7 +514,7 @@ class Campaign:
                 jid = segments[-1]["job_id"]
                 last_state = (states.get(jid) or {}).get("status")
                 if last_state in {"FAILED", "COMPLETED"} and submit_dir is not None:
-                    timed_out = _is_submitit_timeout(jid, submit_dir, status=last_state)
+                    timed_out = is_timeout(jid, submit_dir, status=last_state)
                     if timed_out:
                         last_state = "TIMEOUT"
 
@@ -554,7 +547,7 @@ class Campaign:
         # Those are independent filesystem probes, so they still go through the
         # shared I/O pool -- on a networked filesystem it is the per-probe
         # latency, not CPU, that a campaign of thousands of chains pays for.
-        return _map_io(_chain_status, list(ledger.chains.items()))
+        return map_io(_chain_status, list(ledger.chains.items()))
 
     # --- repair -------------------------------------------------------------
 

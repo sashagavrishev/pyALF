@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..cluster_submission import _map_io
+from .._io import map_io
 
 SEGMENT_SUBDIR = "segments"
 LEDGER_VERSION = 1
@@ -238,7 +238,7 @@ class Ledger:
                 merged += 1
             return merged
 
-        return sum(_map_io(_absorb_one, records))
+        return sum(map_io(_absorb_one, records))
 
     def save(self) -> Path:
         """Atomically write the ledger."""

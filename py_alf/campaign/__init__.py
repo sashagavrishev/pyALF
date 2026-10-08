@@ -14,8 +14,8 @@ clock or a preemption cut short, and ``reconcile`` resubmits whatever neither
 delivered. See :mod:`py_alf.campaign.campaign`.
 """
 
+from ..slurm import ACTIVE_STATES
 from .campaign import (
-    ACTIVE_STATES,
     DEFAULT_HOURS_PER_BIN,
     Campaign,
     ChainStatus,

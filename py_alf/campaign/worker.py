@@ -20,7 +20,7 @@ from pathlib import Path
 
 import submitit
 
-from ..cluster_submission import _exec_alf_binary
+from ..execute import exec_alf_binary
 from .ledger import DEFAULT_COUNTING_OBS, segment_dir
 from .policy import SegmentPolicy
 
@@ -158,7 +158,7 @@ def run_segment(sim) -> None:
     started = time.time()
     sim.run(only_prep=True)
     _claim_running(sim_dir, job_id)
-    _exec_alf_binary(
+    exec_alf_binary(
         sim.sim_dir,
         sim.n_omp,
         sim.n_mpi,

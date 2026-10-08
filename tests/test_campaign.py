@@ -249,9 +249,9 @@ def _status_with(tmp_path, bins, segments, slurm_state=None):
 
     camp = _campaign(tmp_path)
     with (
-        patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states),
+        patch("py_alf.campaign.campaign.job_states", return_value=states),
         patch(
-            "py_alf.campaign.campaign._bin_counts",
+            "py_alf.campaign.campaign.read_bin_counts",
             side_effect=lambda paths, *a, **k: [bins] * len(paths),
         ),
     ):
@@ -311,10 +311,10 @@ def _status_counting_reads(tmp_path, chains, states=None, **kwargs):
     camp = _campaign(tmp_path)
     with (
         patch(
-            "py_alf.campaign.campaign._get_slurm_status_bulk",
+            "py_alf.campaign.campaign.job_states",
             return_value=states or {},
         ),
-        patch("py_alf.campaign.campaign._bin_counts", side_effect=_counted),
+        patch("py_alf.campaign.campaign.read_bin_counts", side_effect=_counted),
     ):
         return camp.status(Ledger.load(tmp_path / "c.json"), **kwargs), read
 
@@ -382,9 +382,9 @@ def test_status_caches_what_it_read_for_the_next_run(tmp_path):
     led.save()
     camp = _campaign(tmp_path)
     with (
-        patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value={}),
+        patch("py_alf.campaign.campaign.job_states", return_value={}),
         patch(
-            "py_alf.campaign.campaign._bin_counts",
+            "py_alf.campaign.campaign.read_bin_counts",
             side_effect=lambda paths, *a, **k: [100] * len(paths),
         ),
     ):
@@ -472,9 +472,7 @@ def test_the_cached_answer_matches_what_a_full_read_would_say(tmp_path):
 
     def run(deep):
         camp = _campaign(tmp_path)
-        with patch(
-            "py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states
-        ):
+        with patch("py_alf.campaign.campaign.job_states", return_value=states):
             st = camp.status(Ledger.load(tmp_path / "c.json"), deep=deep)
         return {s.chain_id: s.bins for s in st}
 
@@ -497,7 +495,7 @@ def test_a_stale_worker_record_never_undercounts_a_running_chain(tmp_path):
     led.save()
     camp = _campaign(tmp_path)
     with patch(
-        "py_alf.campaign.campaign._get_slurm_status_bulk",
+        "py_alf.campaign.campaign.job_states",
         return_value={"1_2": {"status": "RUNNING"}},
     ):
         assert camp.status(Ledger.load(tmp_path / "c.json"))[0].bins == 55
@@ -509,7 +507,7 @@ def test_status_leaves_the_ledger_alone_when_told_not_to_persist(tmp_path):
     led.save()
     before = (tmp_path / "c.json").read_text()
     camp = _campaign(tmp_path)
-    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value={}):
+    with patch("py_alf.campaign.campaign.job_states", return_value={}):
         assert camp.status(persist=False)[0].bins == 100
     assert (tmp_path / "c.json").read_text() == before
 
@@ -604,11 +602,11 @@ def test_a_count_taken_while_a_job_ran_is_never_reused(tmp_path):
     camp = _campaign(tmp_path)
     with (
         patch(
-            "py_alf.campaign.campaign._get_slurm_status_bulk",
+            "py_alf.campaign.campaign.job_states",
             return_value={"1_0": {"status": "RUNNING"}},
         ),
         patch(
-            "py_alf.campaign.campaign._bin_counts",
+            "py_alf.campaign.campaign.read_bin_counts",
             side_effect=lambda paths, *a, **k: [55] * len(paths),
         ),
     ):
@@ -629,11 +627,11 @@ def test_the_marker_is_dropped_when_a_chain_starts_running_again(tmp_path):
     camp = _campaign(tmp_path)
     with (
         patch(
-            "py_alf.campaign.campaign._get_slurm_status_bulk",
+            "py_alf.campaign.campaign.job_states",
             return_value={"1_0": {"status": "RUNNING"}},
         ),
         patch(
-            "py_alf.campaign.campaign._bin_counts",
+            "py_alf.campaign.campaign.read_bin_counts",
             side_effect=lambda paths, *a, **k: [70] * len(paths),
         ),
     ):
@@ -657,9 +655,7 @@ def test_caching_an_unfinished_chain_agrees_with_a_full_read(tmp_path):
 
     def run(deep):
         camp = _campaign(tmp_path)
-        with patch(
-            "py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states
-        ):
+        with patch("py_alf.campaign.campaign.job_states", return_value=states):
             return {s.chain_id: s.bins for s in camp.status(deep=deep)}
 
     truth = {"idle": 40, "running": 55}
@@ -691,7 +687,7 @@ def test_status_reports_every_chain_to_the_progress_hook_exactly_once(tmp_path):
 
     seen: list[tuple[int, str]] = []
     camp = _campaign(tmp_path)
-    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states):
+    with patch("py_alf.campaign.campaign.job_states", return_value=states):
         statuses = camp.status(
             Ledger.load(tmp_path / "c.json"),
             on_progress=lambda n, p: seen.append((n, p)),
@@ -709,7 +705,7 @@ def test_the_progress_hook_is_optional(tmp_path):
     led.data["chains"]["a"] = _chain_on_disk(tmp_path, "a", 100, "1_0", worker_bins=100)
     led.save()
     camp = _campaign(tmp_path)
-    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value={}):
+    with patch("py_alf.campaign.campaign.job_states", return_value={}):
         assert camp.status()[0].bins == 100  # must not raise
 
 
@@ -904,7 +900,7 @@ def test_reconcile_resubmits_only_what_stalled(tmp_path):
             "unstarted": (0, None),
         },
     )
-    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states):
+    with patch("py_alf.campaign.campaign.job_states", return_value=states):
         camp.reconcile(verbose=False)
 
     resubmitted = {s.sim_dir for call in sub.calls for s in call["sims"]}
@@ -915,19 +911,19 @@ def test_reconcile_leaves_a_suspect_chain_alone_until_forced(tmp_path):
     """Zero bins after a run is a crash signature; requeueing it would loop."""
     specs = {"suspect": (0, "FAILED")}
     camp, sub, states = _reconcile_campaign(tmp_path, specs)
-    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states):
+    with patch("py_alf.campaign.campaign.job_states", return_value=states):
         camp.reconcile(verbose=False)
     assert sub.calls == []
 
     camp, sub, states = _reconcile_campaign(tmp_path, specs)
-    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states):
+    with patch("py_alf.campaign.campaign.job_states", return_value=states):
         camp.reconcile(force=True, verbose=False)
     assert [s.sim_dir for s in sub.calls[0]["sims"]] == [str(tmp_path / "suspect")]
 
 
 def test_reconcile_reports_without_submitting_when_asked(tmp_path):
     camp, sub, states = _reconcile_campaign(tmp_path, {"resumable": (40, "FAILED")})
-    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states):
+    with patch("py_alf.campaign.campaign.job_states", return_value=states):
         statuses = camp.reconcile(submit=False, verbose=False)
     assert sub.calls == []
     assert [s.verdict for s in statuses] == ["resumable"]
@@ -946,7 +942,7 @@ def test_reconcile_persists_the_worker_records_it_absorbed(tmp_path):
     (seg / "000-900_0.json").write_text(
         json.dumps({"job_id": "900_0", "bins_after": 40, "elapsed_s": 1234})
     )
-    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states):
+    with patch("py_alf.campaign.campaign.job_states", return_value=states):
         camp.reconcile(submit=False, verbose=False)
 
     on_disk = Ledger.load(tmp_path / "c.json").chains["resumable"]
