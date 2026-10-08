@@ -373,31 +373,13 @@ class Campaign:
         deep: bool = False,
         on_progress: ProgressFn | None = None,
     ) -> dict[str, int]:
-        """Every chain's bin count, opening as few ``data.h5`` files as possible.
+        """Every chain's bin count, from the ledger where it is settled, else from disk.
 
-        Reading the whole grid is what makes a status check expensive, and most
-        of those reads answer a question that is already settled. Three tiers,
-        cheapest first:
-
-        1. a chain the ledger records at its target is finished and is trusted
-           outright -- bins only ever increase, and the worker stops on the
-           target rather than past it;
-        2. a chain with no running job whose cached count was itself taken while
-           it was idle, at the segment list it still has, keeps that count --
-           nothing writes to an idle chain's file, and no job has started since
-           (:meth:`~py_alf.campaign.ledger.Ledger.bins_still_stand`). This is
-           the tier that carries a mid-campaign grid, where almost nothing has
-           reached its target yet;
-        3. a chain with no running job is however many bins its last segment
-           reported writing (:func:`py_alf.campaign.worker.run_segment` records
-           ``bins_after``); nothing has touched the file since it ended;
-        4. anything else -- a live job, or a chain whose worker record is
-           missing because it died before writing one -- is read from disk, as
-           one batch.
-
-        ``deep`` skips the first two tiers, for when the data is suspected to
-        have changed underneath the ledger (files restored, a chain re-run by
-        hand, a count written by an older version).
+        A chain the ledger records at its target is finished, and an idle chain
+        holds the ``bins_after`` its last segment reported, since nothing has
+        written to it since. Live chains, and idle ones whose worker died before
+        reporting, are read as one batch. ``deep`` reads every chain, for when
+        the data may have changed underneath the ledger.
         """
         known: dict[str, int] = {}
         needs_read: list[str] = []
@@ -409,9 +391,6 @@ class Campaign:
                 known[chain_id] = cached
                 continue
             if not deep and not _has_active_job(record, states):
-                if ledger.bins_still_stand(record) and isinstance(cached, int):
-                    known[chain_id] = cached
-                    continue
                 reported = _bins_reported_by_worker(record)
                 if reported is not None:
                     known[chain_id] = reported
@@ -481,14 +460,7 @@ class Campaign:
         bins_by_id = self._resolve_bins(
             ledger, states, deep=deep, on_progress=on_progress
         )
-        # Only a count taken while nothing was writing may be reused next time,
-        # so the caching side has to know which chains those were.
-        settled = {
-            chain_id
-            for chain_id, record in ledger.chains.items()
-            if not _has_active_job(record, states)
-        }
-        moved = ledger.record_bins(bins_by_id, settled=settled)
+        moved = ledger.record_bins(bins_by_id)
         if persist and (moved or absorbed):
             ledger.save()
 

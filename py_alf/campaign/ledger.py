@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Collection
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -123,60 +122,19 @@ class Ledger:
         """Append a submitted segment to a chain's history."""
         self.data["chains"][chain_id].setdefault("segments", []).append(segment)
 
-    def record_bins(
-        self, counts: dict[str, int], settled: Collection[str] = ()
-    ) -> bool:
-        """Cache each chain's measured bin count. True if anything changed.
+    def record_bins(self, counts: dict[str, int]) -> bool:
+        """Cache each chain's bin count. True if anything changed.
 
-        This is what stops a status check paying for the whole grid every time.
-        A chain that has reached its target is finished -- ALF only ever appends
-        bins, and the worker sizes its last segment to land exactly on the
-        target -- so once that count is written here, no later run needs to open
-        that ``data.h5`` again.
-
-        Only a *higher* count is recorded. A read that raced ALF's writer, or a
-        directory that has yet to appear on a lagging filesystem, comes back low
-        or zero, and letting that overwrite a good value would make the campaign
-        look like it had gone backwards.
-
-        ``settled`` names the chains that had no job running when this count was
-        taken, and is what lets an *unfinished* chain be cached too: nothing
-        writes to an idle chain's ``data.h5``, so its count still stands next
-        time. Recorded as ``bins_segments``, the chain's segment count at the
-        moment of reading, because "idle then and idle now" is not enough on its
-        own -- a job could have run and finished in between. Submitting one adds
-        a segment, so a segment count that still matches means nothing has run
-        since. A chain read while a job *was* running gets no marker at all: its
-        file was being appended to as it was read, and that count is a snapshot,
-        not a resting value.
+        Only a higher count is recorded: a read that raced ALF's writer can come
+        back low, and bins never decrease.
         """
         changed = False
         for chain_id, bins in counts.items():
             record = self.data["chains"].get(chain_id)
-            if record is None:
-                continue
-            if bins > record.get("bins", -1):
+            if record is not None and bins > record.get("bins", -1):
                 record["bins"] = int(bins)
                 changed = True
-            marker = len(record.get("segments", [])) if chain_id in settled else None
-            if marker != record.get("bins_segments"):
-                if marker is None:
-                    record.pop("bins_segments", None)
-                else:
-                    record["bins_segments"] = marker
-                changed = True
         return changed
-
-    def bins_still_stand(self, record: dict[str, Any]) -> bool:
-        """True if this chain's cached count can be reused without reading.
-
-        Only ever true for a count :meth:`record_bins` took while the chain was
-        idle, and only while its segment list is the one it was taken at. The
-        caller still has to establish that no job is running *now* -- this
-        answers the other half, that none has run since.
-        """
-        marker = record.get("bins_segments")
-        return marker is not None and marker == len(record.get("segments", []))
 
     def add_followup(self, record: dict[str, Any]) -> None:
         """Record a job chained after the campaign (e.g. an analysis stage)."""

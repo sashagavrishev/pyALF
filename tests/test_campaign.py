@@ -553,98 +553,10 @@ def test_chain_status_complete_tracks_the_target():
 
 
 # --- caching an unfinished chain --------------------------------------------
-#
-# The tier that carries a mid-campaign grid: almost nothing has reached its
-# target, so trusting only finished chains saves almost nothing. An idle chain's
-# data.h5 is not being written either -- but "idle now" alone is not enough, and
-# these pin the cases where it is not.
-
-
-def test_an_idle_unfinished_chain_is_served_from_the_ledger(tmp_path):
-    """Nothing writes to an idle chain, so last time's count still stands."""
-    record = _chain_on_disk(tmp_path, "idle", 40, "1_0")
-    record.update(bins=40, bins_segments=1)
-    statuses, read = _status_counting_reads(
-        tmp_path, {"idle": record}, states={"1_0": {"status": "FAILED"}}
-    )
-    assert read == []
-    assert statuses[0].bins == 40
-    assert statuses[0].verdict == "resumable"
-
-
-def test_a_chain_that_ran_since_the_count_was_cached_is_re_read(tmp_path):
-    """Idle, then a job ran to completion, then idle again -- the count moved.
-
-    The chain looks exactly like the one above at both ends: not running now,
-    not running when the count was taken. Only the extra segment says a job
-    happened in between, which is why the marker records the segment list and
-    not merely the fact that the chain was idle.
-    """
-    record = _chain_on_disk(tmp_path, "ran", 40, "1_0")
-    record["segments"].append({"job_id": "1_1"})
-    record.update(bins=40, bins_segments=1)
-    _, read = _status_counting_reads(
-        tmp_path,
-        {"ran": record},
-        states={"1_0": {"status": "FAILED"}, "1_1": {"status": "COMPLETED"}},
-    )
-    assert read == [str(tmp_path / "ran" / "data.h5")]
-
-
-def test_a_count_taken_while_a_job_ran_is_never_reused(tmp_path):
-    """A count read from a file being appended to is a snapshot, not a resting value.
-
-    status must refuse to mark it, so that once the job ends the chain is read
-    again rather than frozen at whatever it happened to hold mid-run.
-    """
-    led = _ledger(tmp_path)
-    led.data["chains"]["live"] = _chain_on_disk(tmp_path, "live", 55, "1_0")
-    led.save()
-    camp = _campaign(tmp_path)
-    with (
-        patch(
-            "py_alf.campaign.campaign.job_states",
-            return_value={"1_0": {"status": "RUNNING"}},
-        ),
-        patch(
-            "py_alf.campaign.campaign.read_bin_counts",
-            side_effect=lambda paths, *a, **k: [55] * len(paths),
-        ),
-    ):
-        camp.status(Ledger.load(tmp_path / "c.json"))
-
-    on_disk = Ledger.load(tmp_path / "c.json").chains["live"]
-    assert on_disk["bins"] == 55
-    assert "bins_segments" not in on_disk, "a mid-run count must not be marked"
-
-
-def test_the_marker_is_dropped_when_a_chain_starts_running_again(tmp_path):
-    """A resumed chain must lose the marker its idle spell earned it."""
-    led = _ledger(tmp_path)
-    record = _chain_on_disk(tmp_path, "resumed", 40, "1_0")
-    record.update(bins=40, bins_segments=1)
-    led.data["chains"]["resumed"] = record
-    led.save()
-    camp = _campaign(tmp_path)
-    with (
-        patch(
-            "py_alf.campaign.campaign.job_states",
-            return_value={"1_0": {"status": "RUNNING"}},
-        ),
-        patch(
-            "py_alf.campaign.campaign.read_bin_counts",
-            side_effect=lambda paths, *a, **k: [70] * len(paths),
-        ),
-    ):
-        camp.status(Ledger.load(tmp_path / "c.json"))
-
-    on_disk = Ledger.load(tmp_path / "c.json").chains["resumed"]
-    assert on_disk["bins"] == 70
-    assert "bins_segments" not in on_disk
 
 
 def test_caching_an_unfinished_chain_agrees_with_a_full_read(tmp_path):
-    """Same property as the finished-chain case, for the tier that replaces it."""
+    """Same property as the finished-chain case, for idle unfinished chains."""
     chains = {
         "idle": _chain_on_disk(tmp_path, "idle", 40, "1_0"),
         "running": _chain_on_disk(tmp_path, "running", 55, "1_1"),
