@@ -1,11 +1,7 @@
-"""One Markov chain: the unit a campaign schedules.
+"""One Markov chain: one ``Simulation``, the unit a campaign schedules.
 
-A *chain* is one ``Simulation`` -- one set of parameters, one Monte-Carlo seed,
-one ``sim_dir`` -- driven to a bin target by however many jobs that takes. What
-makes a chain physically distinct (a disorder realisation, a point of a
-parameter grid) is the caller's business: it builds the ``Simulation`` objects
-and hands them over, so a campaign resolves exactly the directories that
-caller's analysis already looks in.
+The caller builds the ``Simulation`` objects, so a campaign runs in exactly the
+directories that caller's analysis reads.
 """
 
 from __future__ import annotations
@@ -17,21 +13,16 @@ from typing import Any
 
 from ..simulation import Simulation
 
-# Run controls: they change how long a job runs, never what it computes, and
-# (verified against ALF's parameter list) never appear in sim_dir. Excluded from
-# chain_id so a chain keeps its identity across segments with different budgets.
+# Run controls change how long a job runs, never what it computes, and never
+# enter sim_dir, so they are left out of a chain's recorded parameters.
 RUN_CONTROL_KEYS = ("CPU_MAX", "NBin")
 
 
 def chain_id(sim: Simulation, mc_seed: int) -> str:
-    """Stable short identifier for the chain that ``sim`` runs.
+    """Stable short identifier for the chain ``sim`` runs with ``mc_seed``.
 
-    Hashes the *directory name* rather than the parameter dict: that name is
-    already a canonical rendering of every Hamiltonian parameter, so the id
-    inherits its uniqueness while staying independent of the data root --
-    relocating the data does not renumber anything. ``mc_seed`` is folded in so
-    two chains sharing a parameter set but running different Markov chains stay
-    distinguishable.
+    Hashes the directory name, a canonical rendering of the parameters, so the
+    id survives moving the data root.
     """
     key = f"{sim.ham_name}|{os.path.basename(sim.sim_dir)}|{mc_seed}"
     return hashlib.blake2b(key.encode(), digest_size=6).hexdigest()

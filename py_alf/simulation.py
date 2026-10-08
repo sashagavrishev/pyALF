@@ -90,6 +90,10 @@ class Simulation:
         Full postprocessing support only exists with HDF5.
     env : dict of str, optional
         Extra environment variables for the ALF process (e.g. ``ALF_DELAY_K``).
+    mc_seed : int, optional
+        Monte-Carlo seed, written as the first line of ``seeds``. A single-rank
+        job reads only that line, so this is what makes separate single-core
+        jobs independent Markov chains. Default: ALF's stock ``seeds`` file.
 
     """
 
@@ -116,13 +120,6 @@ class Simulation:
             os.path.expanduser(os.path.join(sim_root, dir_component))
         )
         self.mpi = kwargs.pop("mpi", False)
-        # Explicit Monte-Carlo seed. When set, _prep_sim_dir writes a `seeds`
-        # file whose first line is this integer instead of copying ALF's stock
-        # pool. A single-rank NOMPI job reads only that first line
-        # (Set_random_mod.F90, #else branch), so this is what gives each such
-        # job an independent Markov chain -- essential when disorder
-        # realisations run as separate single-core jobs rather than as ranks of
-        # one PARALLEL_PARAMS job (where ALF hands each rank a distinct line).
         self.mc_seed = kwargs.pop("mc_seed", None)
         self.parallel_params = kwargs.pop("parallel_params", False)
         self.n_mpi = kwargs.pop("n_mpi", 1)
@@ -395,10 +392,8 @@ def _prep_sim_dir(alf_src, sim_dir, ham_name, sim_dict, mc_seed=None):
                 "seeds",
             )
         else:
-            # Write an explicit seeds file. Set_Random_number_Generator reads
-            # the first line for a single-rank job, so mc_seed goes on line 1;
-            # the extra lines keep the file valid for the (unused here) MPI read
-            # path that consumes ISIZE lines.
+            # See Simulation's mc_seed; the extra lines keep the file valid for
+            # ALF's MPI read path, which consumes one line per rank.
             with open("seeds", "w", encoding="UTF-8") as f:
                 for _ in range(16):
                     f.write(f"{int(mc_seed)}\n")

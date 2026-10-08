@@ -141,29 +141,13 @@ class Ledger:
         self.data.setdefault("followups", []).append(record)
 
     def absorb_segment_records(self, skip_finished: bool = False) -> int:
-        """Merge worker-written segment records into the ledger.
+        """Merge worker-written segment records into the ledger, by ``job_id``.
 
-        Matches on ``job_id`` and fills in what only the node knew: bins before
-        and after, elapsed time, and the ``CPU_MAX`` it actually chose. Returns
-        the number of records folded in.
-
-        ``scontrol requeue`` reuses the job id, so several worker records can
-        match one submitted segment. Records are read in filename order, which
-        is job-then-timestamp, so the ledger ends up holding the latest
-        attempt; the per-chain record files keep them all, which is what
-        :func:`~py_alf.campaign.worker.measured_hours_per_bin` reads.
-
-        Each chain's ``segment_dir`` scan is a directory listing plus however
-        many small JSON reads it turns up, independent of every other chain's
-        -- the same shape of filesystem probe :class:`~py_alf.campaign.campaign.Campaign`
-        already fans out, so a campaign with thousands of chains does not pay
-        for this scan one chain at a time.
-
-        ``skip_finished`` drops the chains :meth:`record_bins` has already seen
-        reach their target: no further segment will ever run for one, so its
-        directory can only hold records that were folded in on an earlier pass.
-        Late in a campaign that is nearly the whole grid, and the listings it
-        avoids are the bulk of what a status check has left to pay for.
+        Fills in what only the node knew (bins before and after, elapsed time,
+        the ``CPU_MAX`` it chose) and returns how many records were folded in.
+        A requeue reuses the job id; records are read in time order, so the
+        latest attempt wins. ``skip_finished`` skips chains already at their
+        target, which can gain no new records.
         """
         records = list(self.data["chains"].values())
         if skip_finished:

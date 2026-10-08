@@ -44,8 +44,7 @@ def exec_alf_binary(sim: Simulation, executable: str | Path | None = None) -> No
     sim_dir = Path(sim.sim_dir)
     _check_fresh_start(sim_dir)
     env = getenv(sim.config, sim.alf_src.alf_dir)
-    # Prefer SLURM_CPUS_PER_TASK so OMP_NUM_THREADS exactly matches the
-    # allocated CPU slots, which is best practice for hybrid MPI+OpenMP jobs.
+    # Under SLURM, match the threads to the cores actually allocated.
     env["OMP_NUM_THREADS"] = os.environ.get("SLURM_CPUS_PER_TASK", str(sim.n_omp))
     env.update(sim.env)
 

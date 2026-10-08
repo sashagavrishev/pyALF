@@ -1,31 +1,4 @@
-"""A campaign: a grid of independent Markov chains driven to a bin target.
-
-The caller declares *what* to compute -- a set of chains and how many bins each
-needs -- and this module works out how to get there within a queue that will not
-run a job for longer than two days.
-
-One SLURM array is submitted per group of chains, and three layers then carry
-them to the target:
-
-1. ``CPU_MAX`` (see :mod:`py_alf.campaign.policy`) -- ALF stops itself cleanly
-   at a bin boundary inside the partition's wall-time limit, having flushed both
-   ``data.h5`` and its checkpoint;
-2. submitit's checkpoint/requeue (see :func:`py_alf.campaign.worker.run_segment`)
-   -- an automatic retry when the task is preempted or the time estimate was
-   wrong, bounded by the array's ``max_requeues``;
-3. :func:`Campaign.reconcile` -- repairs what neither covers: cancellation, node
-   failure, an exhausted retry budget.
-
-The third exists because the first two can fail in ways SLURM will not report
-honestly -- under submitit a wall-clock stop is recorded as ``FAILED`` or
-``CANCELLED``, never ``TIMEOUT``, and is indistinguishable by exit code from a
-genuine crash. So progress is judged by *bins on disk*, never by job state.
-
-Nothing here knows about any particular model or machine: the caller supplies
-the chains, a configured :class:`~py_alf.cluster_submission.ClusterSubmitter`,
-where the ledger lives, the partition limits, and -- optionally -- a cost model
-saying what a bin of *its* Hamiltonian costs.
-"""
+"""Launch, status and reconcile for a grid of chains; see :mod:`py_alf.campaign`."""
 
 from __future__ import annotations
 
@@ -46,16 +19,11 @@ from .ledger import DEFAULT_COUNTING_OBS, Ledger
 from .policy import SegmentPolicy
 from .worker import SegmentPlan, measured_hours_per_bin, run_segment
 
-# Reports progress out of a long scan: ``(n_settled, phase)``. A campaign can
-# hold tens of thousands of chains, so a caller driving one from a terminal
-# needs to see movement -- but which chains are cheap is this layer's business,
-# not the caller's, hence a hook rather than an exposed work breakdown.
+# Progress hook for a long scan: ``(n_settled, phase)``.
 ProgressFn = Callable[[int, str], None]
 
-# Hours per bin assumed for a chain that has neither measured itself yet nor
-# been given a ``cost_model``. Deliberately model-free -- only the caller knows
-# what its Hamiltonian costs -- and only ever sizes the first segment, which the
-# worker's own measurement then supersedes.
+# Hours per bin for a chain with neither a measurement nor a cost model; it only
+# sizes that chain's first segment.
 DEFAULT_HOURS_PER_BIN = 1.0
 
 
@@ -65,8 +33,7 @@ class ChainStatus:
 
     chain_id: str
     sim_dir: str
-    # Grid coordinates as the launcher recorded them (a disorder seed, a sweep
-    # value); the core reads none of them, it only carries them back out.
+    # The launcher's grid coordinates, carried through unread.
     point: dict[str, Any]
     bins: int
     target_bins: int
@@ -97,13 +64,11 @@ class Campaign:
     ledger_path: Path
     policy: SegmentPolicy = field(default_factory=SegmentPolicy)
     job_name_prefix: str | None = None
-    # Observable whose bin count measures progress, and the a-priori
-    # hours-per-bin estimate for a chain that has not measured itself yet
-    # (``None`` falls back to :data:`DEFAULT_HOURS_PER_BIN`).
+    # The observable whose bins count as progress, and the hours-per-bin
+    # estimate for a chain that has not measured itself yet.
     counting_obs: str = DEFAULT_COUNTING_OBS
     cost_model: Callable[[dict], float] | None = None
-    # Labels recorded in the ledger for provenance; nothing is resolved from
-    # them, since ``ledger_path`` already says where this campaign lives.
+    # Provenance labels recorded in the ledger; nothing is resolved from them.
     experiment: str = ""
     env_name: str = ""
     # Each array's submitit files go to ``jobs_dir/<array_key>/<array id>/``;
@@ -185,7 +150,7 @@ class Campaign:
     # --- estimation ---------------------------------------------------------
 
     def hours_per_bin_for(self, chain: Chain) -> float:
-        """Best available seconds-per-bin estimate for ``chain``, in hours.
+        """Best hours-per-bin estimate for ``chain``.
 
         Measurement from the chain's own history wins; failing that the
         injected cost model, and only then a flat guess.
@@ -320,10 +285,8 @@ class Campaign:
         ledger: Ledger,
         verbose: bool,
     ) -> None:
-        # Per-array overrides of the shared submitter: submitit's requeue
-        # countdown starts at ``attempts`` and is decremented once per
-        # *timed-out* requeue (a preemption requeue does not decrement), and an
-        # explicit name gives each array its own job name.
+        # submitit's requeue budget counts timed-out requeues only; a
+        # preemption requeue does not use it up.
         job_properties: dict[str, Any] = {}
         job_name = self._job_name(key)
         if job_name is not None:
@@ -419,8 +382,7 @@ class Campaign:
                     continue
             needs_read.append(chain_id)
 
-        # The tiers above are pure dict lookups, so credit them in one step
-        # rather than pretending they took measurable time.
+        # Settled from the ledger, so reported in one step.
         if on_progress is not None:
             on_progress(len(known), "cached")
 
@@ -448,24 +410,14 @@ class Campaign:
     ) -> list[ChainStatus]:
         """Per-chain progress and a verdict, judged by bins rather than job state.
 
-        ``deep`` re-reads every chain's ``data.h5`` instead of trusting the
-        ledger's cached counts (see :meth:`_resolve_bins`). ``persist`` writes
-        the counts back, which is what makes the next check cheap; pass False
-        for a caller that must not touch the ledger.
-
-        ``on_progress(n, phase)`` is called as chains are resolved: ``n`` is how
-        many were settled by this step and ``phase`` names what is being done,
-        so a caller can drive a progress bar without knowing the tiers. Every
-        chain is reported exactly once, so the counts sum to the grid size.
-        Rendering is the caller's business -- this layer has no opinion about
-        terminals, and none of the reporting happens unless a hook is passed.
+        ``deep`` reads every ``data.h5`` instead of trusting the ledger's
+        counts. ``persist`` writes the counts back to the ledger.
+        ``on_progress(n, phase)`` reports each chain exactly once, as it is
+        settled.
         """
         ledger = ledger or Ledger.load(self.ledger_path)
         if on_progress is not None:
-            # No count: the scan is a fixed pass over the unfinished chains, and
-            # naming it is what keeps the bar from looking hung during it.
-            # Phase names stay terse -- they are a bar label, and a long one
-            # leaves tqdm no width to draw the bar itself in.
+            # Names the scan of segment records, which settles no chain itself.
             on_progress(0, "scanning")
         absorbed = ledger.absorb_segment_records(skip_finished=not deep)
 
@@ -533,11 +485,8 @@ class Campaign:
                 verdict=verdict,
             )
 
-        # The bin counts are already resolved; what is left per chain is a
-        # submitit log read, and only for one whose last segment just ended.
-        # Those are independent filesystem probes, so they still go through the
-        # shared I/O pool -- on a networked filesystem it is the per-probe
-        # latency, not CPU, that a campaign of thousands of chains pays for.
+        # What is left per chain is at most one submitit log read, an
+        # independent filesystem probe, so they share the I/O pool.
         return map_io(_chain_status, list(ledger.chains.items()))
 
     # --- repair -------------------------------------------------------------
@@ -552,15 +501,11 @@ class Campaign:
         """Resubmit chains that neither ``CPU_MAX`` nor a requeue carried home.
 
         Covers a chain that was cancelled, lost its node, or ran out of requeue
-        budget. ``suspect`` chains -- short *and* holding no bins at
-        all -- are reported but not resubmitted without ``force``: a chain that
-        never produced a bin is far more likely to be crashing than timing out,
-        and blindly requeueing it would loop.
+        budget. ``suspect`` chains, short and holding no bins at all, are only
+        resubmitted with ``force``: they are more likely crashing than slow.
         """
         ledger = Ledger.load(self.ledger_path)
-        # status() absorbs the worker records and saves the ledger itself, so
-        # doing either here would only scan every chain's segment directory a
-        # second time for what the first pass already folded in.
+        # status() absorbs the worker records and saves the ledger itself.
         statuses = self.status(ledger)
 
         wanted = {"resumable", "unstarted"} | ({"suspect"} if force else set())
@@ -602,11 +547,8 @@ def _has_active_job(record: dict[str, Any], states: dict[str, dict]) -> bool:
 def _bins_reported_by_worker(record: dict[str, Any]) -> int | None:
     """Highest ``bins_after`` this chain's workers recorded, or None if none did.
 
-    Only meaningful for a chain with nothing running: the worker writes this
-    after ALF has flushed, so for an idle chain it *is* what stands on disk, and
-    reading the file back would just confirm it. The maximum rather than the
-    last: segments are held in submission order, and a requeued attempt that
-    crashed early can record fewer bins than one that already succeeded.
+    For an idle chain this is what stands on disk. The maximum, because a
+    requeued attempt that crashed early can record fewer bins than an earlier one.
     """
     reported = [
         s["bins_after"]

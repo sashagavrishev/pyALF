@@ -1,12 +1,7 @@
 """What one array task does on the compute node.
 
-The decisions that depend on progress -- is this chain already finished? how
-much time does it still need? -- are made here, when the task starts and the
-bins on disk are current, rather than at submission time when they would all be
-stale by the time the task ran.
-
-That also makes a requeued attempt cheap: one whose chain has meanwhile reached
-its target returns in seconds instead of burning an allocation.
+Whether the chain is finished, and how long it may still run, is decided here
+when the task starts, from the bins on disk, rather than at submission.
 """
 
 from __future__ import annotations
@@ -42,10 +37,8 @@ class SegmentPlan:
     hours_per_bin: float  # a-priori estimate, superseded by measurement
     partition_rules: dict
     policy: SegmentPolicy
-    # CPU_MAX the array was submitted with, and so the wall time SLURM actually
-    # allocated. The node may ask for less, never more: a larger CPU_MAX would
-    # let ALF run past the point where SLURM kills it, losing the graceful
-    # truncation this whole mechanism depends on.
+    # CPU_MAX the array's wall time was sized for. The node may ask for less,
+    # never more, or ALF would run past SLURM's kill.
     cpu_max_ceiling: float = 0.0
     chain_id: str = ""
     counting_obs: str = DEFAULT_COUNTING_OBS
@@ -134,12 +127,9 @@ def run_segment(sim) -> None:
     if plan.cpu_max_ceiling:
         cpu_max = min(cpu_max, plan.cpu_max_ceiling)
 
-    # Both bounds, so ALF stops at whichever comes first: CPU_MAX keeps the job
-    # inside its allocation, NBin stops it exactly at the target when the target
-    # is reached first. ALF's bin loop counts from 1 for each run and appends, so
-    # NBin = remaining lands on bins_before + remaining. Both are generic VAR_QMC
-    # parameters and never enter directory_name, so varying them per segment
-    # cannot move this chain's sim_dir.
+    # ALF stops at whichever comes first: CPU_MAX inside the allocation, or
+    # NBin = remaining exactly at the target (each run appends from bin 1).
+    # Neither enters directory_name, so sim_dir does not move.
     sim.sim_dict = {
         **sim.sim_dict,
         "CPU_MAX": float(cpu_max),
@@ -152,9 +142,8 @@ def run_segment(sim) -> None:
         f"-> CPU_MAX={cpu_max:.3f} h, NBin={remaining}"
     )
 
-    # Prep here rather than at submission: this renames confout_* -> confin_*,
-    # and a requeued attempt must pick up the checkpoint the interrupted one
-    # left behind, not the one that existed when the array was submitted.
+    # Prep here, not at submission: a requeued attempt must resume from the
+    # checkpoint the interrupted one left.
     started = time.time()
     sim.run(only_prep=True)
     _claim_running(sim_dir, job_id)
@@ -165,9 +154,7 @@ def run_segment(sim) -> None:
     record = {
         "job_id": job_id,
         "chain_id": plan.chain_id,
-        # What this segment's bins were actually computed with, not what HEAD
-        # is now -- lets a later archival pass tell old-commit bins apart from
-        # current ones without trusting anything but the segment itself.
+        # The build these bins came from, for archiving bins of an older commit.
         "alf_commit": getattr(sim.alf_src, "commit", lambda: None)(),
         "cpu_max": float(cpu_max),
         "hours_per_bin_used": hours_per_bin,
@@ -178,9 +165,7 @@ def run_segment(sim) -> None:
     }
     out_dir = segment_dir(sim_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Job id and timestamp, not the job id alone: SLURM reuses a job id when it
-    # requeues, so a requeued attempt would otherwise overwrite the record of
-    # the attempt it is replacing, losing that segment's timing measurement.
+    # A requeue reuses the job id, so the timestamp keeps each attempt's record.
     stamp = record["finished_at"].replace(":", "").replace("-", "")
     (out_dir / f"{job_id}-{stamp}.json").write_text(json.dumps(record, indent=2))
 
@@ -191,16 +176,9 @@ def run_segment(sim) -> None:
 
 
 def _checkpoint_segment(sim) -> submitit.helpers.DelayedSubmission:
-    """Hand submitit an identical call to requeue when this task is interrupted.
+    """Requeue the same call when this task is interrupted.
 
-    It carries no state because there is none to carry: ALF flushes ``data.h5``
-    and ``confout_0.h5`` every bin, so the checkpoint already exists on disk and
-    the requeued call simply re-reads it and resumes.
-
-    This is a safety net, not the primary mechanism. The signal arrives shortly
-    before the wall limit with ALF mid-bin, whereas ``CPU_MAX`` normally has ALF
-    stop cleanly at a bin boundary well before that. It covers preemption, bad
-    time estimates and node contention.
+    ALF's checkpoint is already on disk, so the requeued call simply resumes.
     """
     return submitit.helpers.DelayedSubmission(run_segment, sim)
 

@@ -1,11 +1,4 @@
-"""
-
-cluster_submission
-==================
-
-Provides interfaces for running ALF simulations on a cluster.
-
-"""
+"""Submitting ALF simulations through submitit, to SLURM or locally."""
 
 from __future__ import annotations
 
@@ -31,21 +24,16 @@ logger = logging.getLogger(__name__)
 
 
 class PartitionSpec(TypedDict, total=False):
-    """Per-partition SLURM node resource limits.
+    """One partition's limits, a value of ``ClusterSubmitter(partition_rules=)``.
 
-    Used as values in the *partition_rules* mapping passed to
-    :class:`ClusterSubmitter`.  A bare ``float`` is also accepted and is
-    interpreted as *max_hours* only.
+    A bare number stands for ``max_hours`` alone.
 
     max_hours : float
         Wall-time limit in hours (required).
     max_cpus : int, optional
-        Maximum CPUs available per node.  When supplied the submitter
-        raises :class:`ValueError` if the job's ``n_mpi * n_omp`` (or
-        just ``n_omp`` for non-MPI runs) would exceed this.
+        CPUs per node; a job needing more (``n_mpi * n_omp``) is refused.
     max_mem_gb : float, optional
-        Maximum node memory in GB.  When supplied the submitter raises
-        :class:`ValueError` if ``slurm_mem`` would exceed this.
+        Memory per node; a larger ``slurm_mem`` is refused.
     """
 
     max_hours: float
@@ -145,11 +133,9 @@ def _parse_slurm_time_hours(time_str: str) -> float | None:
 
 
 def _project_root() -> Path:
-    """Walk up from CWD to find the project root, identified by .git or common markers.
+    """Nearest ancestor of the CWD holding ``.git`` or a project file, else the CWD.
 
-    Falls back to CWD when no root is found (e.g. outside any repository).
-    This anchors .pyalf like .git — always at the repo root, never scattered
-    across sub-directories depending on where the script was launched from.
+    Anchors the default ``.pyalf`` at the repository root, wherever a script runs.
     """
     markers = {".git", "pyproject.toml", "setup.py", "setup.cfg"}
     current = Path.cwd()
@@ -190,58 +176,19 @@ def _slurm_time_to_minutes(value: int | str) -> int:
 
 
 class ClusterSubmitter:
-    """
-    Handles job submission using submitit.
+    """Submits simulations as submitit jobs, one SLURM array per call.
 
     Parameters
     ----------
     executor : {'slurm', 'local', 'debug'}
-        Backend to use. ``'slurm'`` submits to a SLURM cluster; ``'local'``
-        runs jobs in local processes (useful for testing without SLURM);
-        ``'debug'`` runs jobs inline and synchronously.
-    submit_dir : str or Path
-        Directory where submitit writes job logs and state.
+        ``'local'`` runs jobs in local processes, ``'debug'`` inline.
+    submit_dir : str or Path, optional
+        Where submitit writes job files; defaults to ``.pyalf`` at the project root.
     slurm_mem : str
-        Memory request per node (e.g. ``'2G'``, ``'8G'``). Required when
-        *executor* is ``'slurm'``.
+        Memory per node, e.g. ``'8G'``. Required for SLURM.
     partition_rules : dict[str, float | PartitionSpec]
-        Mapping of SLURM partition name → resource limits.  Each value is
-        either a plain ``float`` (wall-time limit in hours, backward
-        compatible) or a :class:`PartitionSpec` dict with keys:
-
-        * ``max_hours`` (**required**) – wall-time limit in hours
-          (fractions allowed, e.g. ``10/60`` for 10 minutes).
-        * ``max_cpus`` (*optional*) – maximum CPUs per node; submission
-          fails if ``n_mpi × n_omp`` would exceed this.
-        * ``max_mem_gb`` (*optional*) – maximum node memory in GB;
-          submission fails if ``slurm_mem`` would exceed this.
-
-        At submission time the partition with the smallest *max_hours*
-        that is still ≥ the job's ``CPU_MAX`` is selected automatically.
-        Required when *executor* is ``'slurm'``.  Exclude GPU-only
-        partitions from CPU workloads.
-
-        Example (typical HPC cluster, minimal)::
-
-            partition_rules={
-                "short":      2,      # 2 h
-                "medium":     48,     # 2 days
-                "long":       336,    # 14 days
-                "extra_long": 672,    # 28 days
-            }
-
-        Example with per-node resource limits::
-
-            partition_rules={
-                "short":  {"max_hours": 2,   "max_cpus": 64,  "max_mem_gb": 256},
-                "medium": {"max_hours": 48,  "max_cpus": 128, "max_mem_gb": 512},
-                "long":   {"max_hours": 336, "max_cpus": 128, "max_mem_gb": 512},
-            }
-
-        The ``debug`` partition (10-minute wall time) is intentionally
-        omitted here because ``CPU_MAX`` is always at least 1 hour; submit
-        debug-partition jobs explicitly via ``job_properties``.
-
+        Partition name to limits. Required for SLURM. Each job goes to the
+        partition with the smallest ``max_hours`` that fits its wall time.
     job_name : str, optional
         Job name. Defaults to the Hamiltonian name.
     **executor_params
@@ -366,28 +313,10 @@ class ClusterSubmitter:
         partition: str,
         slurm_mem: str | None = None,
     ) -> None:
-        """Raise :class:`ValueError` if resources exceed the partition's per-node limits.
-
-        Parameters
-        ----------
-        sim:
-            The simulation whose ``n_mpi``, ``n_omp``, and ``mpi`` attributes
-            define the CPU footprint.
-        partition:
-            Name of the SLURM partition that has been (or will be) selected.
-        slurm_mem:
-            Memory string to check (e.g. ``'8G'``).  Defaults to
-            ``self.slurm_mem`` when *None*.
-
-        Raises
-        ------
-        ValueError
-            If ``n_mpi × n_omp`` exceeds ``max_cpus``, or if the requested
-            memory exceeds ``max_mem_gb`` for the given *partition*.
-        """
+        """Raise :class:`ValueError` if *sim*'s CPUs or the memory request
+        (*slurm_mem*, else the instance's) exceed *partition*'s per-node limits."""
         spec = self.partition_rules[partition]
 
-        # ── CPU check ──────────────────────────────────────────────────────────
         total_cpus = (sim.n_mpi if sim.mpi else 1) * sim.n_omp
         max_cpus = spec.get("max_cpus")
         if max_cpus is not None and total_cpus > max_cpus:
@@ -401,7 +330,6 @@ class ClusterSubmitter:
                 f"partition '{partition}' per-node CPU limit of {max_cpus}."
             )
 
-        # ── Memory check ───────────────────────────────────────────────────────
         effective_mem = slurm_mem if slurm_mem is not None else self.slurm_mem
         max_mem_gb = spec.get("max_mem_gb")
         if max_mem_gb is not None and effective_mem:
@@ -443,39 +371,31 @@ class ClusterSubmitter:
         skip_active: bool = True,
         max_requeues: int | None = None,
     ) -> list[submitit.Job]:
-        """
-        Submit one or more Simulation instances to the SLURM cluster.
+        """Submit simulations, as one array when there are several.
 
-        Prepares simulation directories, filters out already-running or broken
-        jobs, then submits via submitit. Job IDs are written to ``jobid.txt``
-        inside each simulation directory so that the status-checking helpers
-        in this module continue to work.
+        Simulations with an active job or a leftover ``RUNNING`` are left out.
+        Each submitted job's id is written to ``jobid.txt`` in its ``sim_dir``.
+        The wall time is ``slurm_time`` if given (per call, then per instance),
+        else ``CPU_MAX`` plus 10% capped at the partition limit.
 
         Parameters
         ----------
         sims : Simulation or iterable of Simulation
             Simulation(s) to submit.
         job_properties : dict, optional
-            Override default SLURM parameters. Keys must match
-            ``executor.update_parameters()`` keyword arguments.
+            Per-call overrides for submitit's ``update_parameters()``.
         submit_dir : str or Path, optional
             Directory for submitit logs and state for this submission, which
             may contain submitit's ``%A``/``%j`` placeholders. Overrides the
             instance-level ``submit_dir`` set at construction.
         runner : callable, optional
-            Function submitit executes on the worker, called with one
-            ``Simulation``. Defaults to :func:`~py_alf.execute.exec_alf_binary`, which execs the binary
-            directly. A caller that must decide *on the node* how to run (e.g.
-            sizing ``CPU_MAX`` from the bins already on disk) passes its own,
-            usually together with ``prep=False``.
+            Called with the simulation on the worker; defaults to
+            :func:`~py_alf.execute.exec_alf_binary`. Pass one that decides on
+            the node how to run, usually with ``prep=False``.
         prep : bool, default=True
-            Run ``sim.run(only_prep=True)`` for each simulation at submission
-            time, writing ``parameters``/``seeds`` and renaming
-            ``confout_* -> confin_*``. Set ``False`` when *runner* preps the
-            directory itself: for a job that may be requeued the rename must
-            happen each time it starts, not once when it was queued. The ALF
-            binary is copied into the simulation directory either way, so the
-            worker can rely on it being there.
+            Prepare each ``sim_dir`` now. ``False`` leaves it to *runner*, which a
+            requeued job needs: the ``confout -> confin`` rename has to happen at
+            each start. The ALF binary is copied in either way.
         stale_running : {'remove', 'skip'}, default='skip'
             What to do with a ``RUNNING`` file left behind by a previous run
             whose job is no longer active: ``'skip'`` leaves the simulation out,
@@ -542,8 +462,7 @@ class ClusterSubmitter:
 
         sim = filtered_sims[0]
 
-        # Guard: all sims in an array job must share the same resource shape,
-        # since submitit applies one set of SLURM parameters to every task.
+        # One array shares one set of SLURM parameters.
         if len(filtered_sims) > 1:
             for s in filtered_sims[1:]:
                 if s.n_omp != sim.n_omp or s.n_mpi != sim.n_mpi or s.mpi != sim.mpi:
@@ -554,25 +473,14 @@ class ClusterSubmitter:
                         f"n_omp={s.n_omp}, n_mpi={s.n_mpi}, mpi={s.mpi}."
                     )
 
-        # A per-call slurm_time wins over the instance one; without either the
-        # wall time follows CPU_MAX.
         slurm_time = (job_properties or {}).get(
             "slurm_time", self.executor_params.get("slurm_time")
         )
         timeout_min, partition = self._wall_time(sim, slurm_time)
 
-        # Build executor parameters from defaults, instance-level kwargs,
-        # then per-call overrides.
-        #
-        # Resource layout for a hybrid MPI + OpenMP job
-        # -----------------------------------------------
-        # tasks_per_node = n_mpi  →  SLURM allocates n_mpi task slots per node,
-        #                            each with cpus_per_task = n_omp CPU cores.
-        # Total cores on the node  = n_mpi × n_omp, matching exactly what
-        # `mpiexec -n n_mpi ./ALF.out` with OMP_NUM_THREADS=n_omp will consume.
-        #
-        # For a pure-OpenMP (no MPI) job tasks_per_node is 1, so a single task
-        # slot owns all n_omp cores and OMP_NUM_THREADS=n_omp fills them.
+        # Defaults, then the instance's options, then this call's. Each MPI rank
+        # is a task slot of n_omp cores, matching mpiexec -n n_mpi with
+        # OMP_NUM_THREADS=n_omp.
         params: dict[str, Any] = {
             "name": self.job_name if self.job_name is not None else sim.ham_name,
             "timeout_min": timeout_min,
@@ -585,30 +493,15 @@ class ClusterSubmitter:
             params["slurm_partition"] = partition
             self._check_node_fit(sim, partition)
             if sim.mpi:
-                # submitit's default batch script wraps the Python launcher in
-                # `srun` *without* an explicit -n flag.  With
-                # #SBATCH --ntasks-per-node=n_mpi that outer srun therefore
-                # spawns n_mpi copies of the Python process.  Each copy then
-                # independently calls `mpiexec -n n_mpi ./ALF.out`, producing
-                # n_mpi² ALF processes and triggering a nested srun / mpiexec
-                # PMI conflict (see facebookincubator/submitit#1757).
-                #
-                # use_srun=False makes the batch script call Python directly
-                # (exactly one process).  That single process then invokes
-                # `mpiexec -n n_mpi`, which sees the n_mpi SLURM task slots
-                # and distributes processes correctly across them.
-                #
-                # OMP_NUM_THREADS is set to sim.n_omp inside sim.run() before
-                # mpiexec is called, consistent with cpus_per_task=n_omp so
-                # each MPI rank fills exactly its allocated cores with threads.
+                # submitit's srun would start one launcher per task slot, each
+                # running its own mpiexec (submitit#1757); one launcher calls
+                # mpiexec once instead.
                 params["slurm_use_srun"] = False
         params.update(self.executor_params)
         params.update(job_properties or {})
-        # Consumed into timeout_min above.
+        # Already folded into timeout_min.
         params.pop("slurm_time", None)
 
-        # Prepare simulation directories and copy binary. With prep=False the
-        # runner preps on the node, so only the binary is staged here.
         for s in filtered_sims:
             if prep:
                 s.run(only_prep=True, copy_bin=True)

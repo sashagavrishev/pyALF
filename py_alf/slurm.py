@@ -57,10 +57,7 @@ def _parent_ids(jobids: list[str]) -> list[str]:
 def _job_states_sacct(
     jobids: list[str],
 ) -> dict[str, dict[str, str | None]]:
-    """
-    Query SLURM sacct for multiple job IDs (including array tasks) in one call.
-    Returns dict: jobid[_index] -> {'status': ..., 'runtime': ..., 'nodelist': ...}
-    """
+    """:func:`job_states` from ``sacct`` alone, for jobs no longer queued."""
     status_map: dict[str, dict[str, str | None]] = {
         jid: {"status": "UNKNOWN", "runtime": None, "nodelist": None} for jid in jobids
     }
@@ -105,27 +102,16 @@ def _job_states_sacct(
 
 
 def job_states(jobids: list[str]) -> dict[str, dict[str, str | None]]:
-    """
-    Query SLURM for multiple job IDs (including array tasks) in one call.
+    """``jobid -> {'status', 'runtime', 'nodelist'}`` for many jobs at once.
 
-    Uses ``squeue`` first (fast, live data); falls back to ``sacct`` for jobs
-    that are no longer in the scheduler queue (completed, failed, etc.).
-
-    Returns
-    -------
-    dict
-        Mapping ``jobid[_task]`` → ``{'status': str, 'runtime': str|None,
-        'nodelist': str|None}``.  ``nodelist`` is the allocated compute node
-        for running jobs, or *None* for pending / finished / inactive jobs.
+    Asks ``squeue`` first and ``sacct`` for jobs that have left the queue.
+    ``nodelist`` is None unless the job is running.
     """
     if not jobids:
         return {}
 
-    # A job in a terminal state can never change again, so it is served from
-    # cache without touching SLURM.  This matters most for the sacct fallback
-    # below: terminal jobs have left the queue, so leaving them in the query set
-    # would make every refresh of a partly-finished session pay for an sacct
-    # call that can only return what is already known.
+    # A job in a terminal state never changes again, so it is served from cache
+    # rather than paid for with another sacct call.
     cached = {
         jid: _terminal_status_cache[jid]
         for jid in jobids
@@ -253,10 +239,8 @@ def is_timeout(jobid: str, folder: str | Path, status: str = "FAILED") -> bool:
         with contextlib.suppress(OSError):
             text = log_path.read_text(errors="replace")
         if text is None:
-            # The log has not appeared yet — on a networked filesystem it can lag
-            # the job's state change.  Caching "not timed out" now would pin that
-            # answer for the session and misreport a real TIMEOUT, so report the
-            # default without caching and look again next refresh.
+            # On a networked filesystem the log can lag the job's state, so
+            # answer without caching and look again next time.
             return False
         cached = (
             "this job is timed-out" in text,
