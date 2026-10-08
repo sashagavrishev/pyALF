@@ -85,10 +85,9 @@ class ChainStatus:
 class Campaign:
     """A named grid of chains, its target, and the policy that paces it.
 
-    ``submitter`` is used as given, so the memory request, wckey and executor
-    are the caller's to decide; only the per-array job name and requeue budget
-    are overridden here. ``partition_rules`` are the same limits that submitter
-    was built with, which the policy needs in raw form.
+    ``submitter`` is used as given, so the memory request, partition limits and
+    executor are the caller's to decide; only the per-array job name and
+    requeue budget are set here.
     """
 
     name: str
@@ -96,7 +95,6 @@ class Campaign:
     target_bins: int
     submitter: ClusterSubmitter
     ledger_path: Path
-    partition_rules: dict[str, Any] = field(default_factory=dict)
     policy: SegmentPolicy = field(default_factory=SegmentPolicy)
     job_name_prefix: str | None = None
     # Observable whose bin count measures progress, and the a-priori
@@ -116,7 +114,6 @@ class Campaign:
         cls,
         ledger_path: str | Path,
         submitter: ClusterSubmitter,
-        partition_rules: dict[str, Any] | None = None,
         *,
         alf_src: ALF_source | None = None,
         machine: str = "GNU",
@@ -151,7 +148,6 @@ class Campaign:
                 Chain(
                     chain_id=cid,
                     sim=sim,
-                    mc_seed=record["mc_seed"],
                     target_bins=record["target_bins"],
                     point=record["point"],
                     array_key=record["array_key"],
@@ -163,7 +159,6 @@ class Campaign:
             target_bins=ledger.target_bins,
             submitter=submitter,
             ledger_path=Path(ledger_path),
-            partition_rules=partition_rules or {},
             policy=SegmentPolicy(**ledger.data.get("policy", {})),
             counting_obs=ledger.counting_obs,
             cost_model=cost_model,
@@ -230,7 +225,7 @@ class Campaign:
         ledger.upsert_chains(self.chains)
         active = self._active_chain_ids(ledger)
 
-        rules = self.partition_rules
+        rules = self.submitter.partition_rules or {}
         for key, chains in self.groups().items():
             idle = [c for c in chains if c.chain_id not in active]
             runnable = self._runnable(idle, bins or {})

@@ -4,7 +4,7 @@
 
 # Classes
 from .alf_source import ALF_source
-from .campaign import Campaign, Chain, ChainStatus, Ledger, SegmentPlan, SegmentPolicy
+from .campaign import Campaign, Chain, ChainStatus, Ledger, SegmentPolicy
 from .cluster_submission import ClusterSubmitter, PartitionSpec
 from .lattice import Lattice
 from .simulation import Simulation
@@ -19,7 +19,6 @@ __all__ = [
     "ClusterSubmitter",
     "Ledger",
     "PartitionSpec",
-    "SegmentPlan",
     "SegmentPolicy",
 ]
 

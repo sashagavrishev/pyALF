@@ -43,7 +43,6 @@ class Chain:
 
     chain_id: str
     sim: Simulation
-    mc_seed: int
     target_bins: int
     # Free-form coordinates of this chain in the caller's grid. Whatever makes
     # the chain distinct beyond its Markov seed goes here -- a disorder seed, a
@@ -53,9 +52,30 @@ class Chain:
     # share a cost: by convention one key per parameter point.
     array_key: str = ""
 
+    @classmethod
+    def from_sim(
+        cls,
+        sim: Simulation,
+        target_bins: int,
+        point: dict[str, Any] | None = None,
+        array_key: str = "",
+    ) -> Chain:
+        """The chain ``sim`` runs, identified by its directory and Monte-Carlo seed."""
+        return cls(
+            chain_id=chain_id(sim, sim.mc_seed),
+            sim=sim,
+            target_bins=target_bins,
+            point=dict(point or {}),
+            array_key=array_key,
+        )
+
     @property
     def sim_dir(self) -> str:
         return self.sim.sim_dir
+
+    @property
+    def mc_seed(self) -> int:
+        return self.sim.mc_seed
 
     def to_record(self) -> dict[str, Any]:
         """Ledger representation (JSON-safe, excludes the Simulation object)."""

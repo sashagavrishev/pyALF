@@ -16,15 +16,10 @@ import pytest
 import submitit
 
 from py_alf.bins import read_bin_counts
-from py_alf.campaign import (
-    Ledger,
-    SegmentPolicy,
-    chain_id,
-    run_segment,
-)
+from py_alf.campaign import Ledger, SegmentPolicy, chain_id
 from py_alf.campaign.campaign import Campaign, ChainStatus
 from py_alf.campaign.chain import Chain
-from py_alf.campaign.worker import _claim_running, _clear_own_running
+from py_alf.campaign.worker import _claim_running, _clear_own_running, run_segment
 from py_alf.simulation import Simulation
 
 # A three-tier cluster of the shape these policies exist to cope with.
@@ -94,6 +89,17 @@ def _sim(sim_dir, ham_name="Hubbard"):
     stub.ham_name = ham_name
     stub.sim_dir = str(sim_dir)
     return stub
+
+
+def test_chain_from_sim_derives_its_id_and_seed(tmp_path):
+    sim = _sim(tmp_path / "Hubbard_L1=4")
+    sim.mc_seed = 7
+    chain = Chain.from_sim(sim, 100, point={"N": 4}, array_key="k")
+
+    assert chain.chain_id == chain_id(sim, 7)
+    assert chain.mc_seed == 7
+    assert chain.to_record()["mc_seed"] == 7
+    assert (chain.target_bins, chain.point, chain.array_key) == (100, {"N": 4}, "k")
 
 
 def test_chain_id_is_deterministic_and_unique(tmp_path):
@@ -225,13 +231,13 @@ def _campaign(tmp_path, chains=()):
     # is absent here, which is the "cannot tell yet" path.
     submitter = MagicMock()
     submitter.submit_dir = tmp_path / "submit"
+    submitter.partition_rules = RULES
     return Campaign(
         name="c",
         chains=list(chains),
         target_bins=100,
         submitter=submitter,
         ledger_path=tmp_path / "c.json",
-        partition_rules=RULES,
     )
 
 
@@ -640,6 +646,7 @@ class _FakeSubmitter:
     def __init__(self, submit_dir, executor="local"):
         self.submit_dir = submit_dir
         self.executor = executor
+        self.partition_rules = RULES
         self.calls = []
         self._array = 1000
 
@@ -668,10 +675,10 @@ def _chain(tmp_path, name, bins, array_key="k", target_bins=100):
         f.create_dataset("Ener_scal/obser", data=np.zeros((bins, 1)))
     sim = _sim(d)
     sim.sim_dict = {}
+    sim.mc_seed = 1
     return Chain(
         chain_id=name,
         sim=sim,
-        mc_seed=1,
         target_bins=target_bins,
         array_key=array_key,
     )
@@ -687,7 +694,6 @@ def _launch_campaign(tmp_path, chains, **kwargs):
         target_bins=100,
         submitter=submitter,
         ledger_path=tmp_path / "c.json",
-        partition_rules=RULES,
         # Pin the cost so a budget is a function of the bins alone.
         cost_model=lambda sim_dict: 0.1,
         **kwargs,
@@ -773,6 +779,15 @@ def test_launch_hands_the_array_its_requeue_budget(tmp_path):
 
     assert sub.calls[0]["max_requeues"] == 4
     assert "slurm_max_num_timeout" not in sub.calls[0]["job_properties"]
+
+
+def test_launch_caps_the_budget_with_the_submitter_partition_rules(tmp_path):
+    """The policy reads the limits the submitter was built with, not a copy."""
+    camp, sub = _launch_campaign(tmp_path, [_chain(tmp_path, "a", 0)])
+    sub.partition_rules = {"medium": {"max_hours": 10.0}}
+    camp.launch(verbose=False)  # 100 bins at 0.1 h would want 13 h
+
+    assert sub.calls[0]["sims"][0].sim_dict["CPU_MAX"] == pytest.approx(10.0 * 0.95)
 
 
 def test_launch_dry_run_submits_nothing_and_writes_no_ledger(tmp_path):
