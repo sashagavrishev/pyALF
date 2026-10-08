@@ -13,13 +13,12 @@ from py_alf.cluster_submission import (
     ClusterSubmitter,
     _exec_alf_binary,
     _find_job_log,
-    _get_jobs_resources_bulk,
     _map_io,
     _normalise_partition_spec,
     _parse_mem_gb,
     _parse_slurm_time_hours,
-    _resource_cache,
     _run_alf,
+    _sanitise_nodelist,
     detect_partition_rules,
 )
 from py_alf.simulation import Simulation
@@ -51,7 +50,7 @@ def _clear_module_caches():
 def test_init_defaults():
     cs = ClusterSubmitter(slurm_mem="2G", partition_rules=_RULES)
     assert cs.executor == "slurm"
-    assert cs.submit_dir.name == ".alfmonitor"
+    assert cs.submit_dir.name == ".pyalf"
     assert cs.submit_dir.is_absolute()
     assert cs.slurm_mem == "2G"
     # partition_rules is normalised to PartitionSpec dicts at construction time
@@ -1476,78 +1475,29 @@ def test_missing_file_is_not_counted_as_a_read_failure(tmp_path, caplog):
     assert caplog.records == []
 
 
-# --- _get_jobs_resources_bulk ---
+# --- _sanitise_nodelist ---
 
 
-def _clear_cache(*jids):
-    for jid in jids:
-        _resource_cache.pop(jid, None)
+def test_sanitise_nodelist_returns_real_node():
+    assert _sanitise_nodelist("compute01") == "compute01"
+    assert _sanitise_nodelist("node[001-004]") == "node[001-004]"
 
 
-def test_get_jobs_resources_bulk_parses_memory_and_efficiency():
-    _clear_cache("RES_BASIC")
-    # --parsable2 uses "|" as delimiter
-    sacct_out = (
-        "RES_BASIC|8192K|01:30:00|04:00:00\nRES_BASIC.batch|8192K|01:30:00|04:00:00\n"
-    )
-    with _mock_subprocess(sacct_out):
-        result = _get_jobs_resources_bulk(["RES_BASIC"])
-    assert result["RES_BASIC"]["max_rss"] == "8M"
-    assert result["RES_BASIC"]["cpu_eff"] == "38%"  # 1.5h / 4.0h = 37.5% → 38%
+def test_sanitise_nodelist_rejects_pending_reason():
+    assert _sanitise_nodelist("(Priority)") is None
+    assert _sanitise_nodelist("(Resources)") is None
+    assert _sanitise_nodelist("(None)") is None
 
 
-def test_get_jobs_resources_bulk_takes_max_rss_across_steps():
-    """The peak RSS is the maximum across the job step and its substeps."""
-    _clear_cache("RES_MAX")
-    sacct_out = (
-        "RES_MAX|4096K|01:00:00|04:00:00\nRES_MAX.batch|8192K|01:00:00|04:00:00\n"
-    )
-    with _mock_subprocess(sacct_out):
-        result = _get_jobs_resources_bulk(["RES_MAX"])
-    assert result["RES_MAX"]["max_rss"] == "8M"
+def test_sanitise_nodelist_rejects_sacct_none_literal():
+    assert _sanitise_nodelist("None") is None
+    assert _sanitise_nodelist("N/A") is None
+    assert _sanitise_nodelist("none") is None
 
 
-def test_get_jobs_resources_bulk_large_memory_shows_gigabytes():
-    _clear_cache("RES_LARGE")
-    sacct_out = "RES_LARGE|4194304K|02:00:00|08:00:00\n"  # 4 GB
-    with _mock_subprocess(sacct_out):
-        result = _get_jobs_resources_bulk(["RES_LARGE"])
-    assert result["RES_LARGE"]["max_rss"] is not None
-    assert "G" in result["RES_LARGE"]["max_rss"]
-
-
-def test_get_jobs_resources_bulk_zero_rss_returns_none():
-    _clear_cache("RES_ZERO")
-    sacct_out = "RES_ZERO|0|01:00:00|04:00:00\n"
-    with _mock_subprocess(sacct_out):
-        result = _get_jobs_resources_bulk(["RES_ZERO"])
-    assert result["RES_ZERO"]["max_rss"] is None
-
-
-def test_get_jobs_resources_bulk_array_task_id():
-    _clear_cache("88888_3")
-    sacct_out = (
-        "88888_3|4096K|00:30:00|02:00:00\n88888_3.batch|8192K|00:30:00|02:00:00\n"
-    )
-    with _mock_subprocess(sacct_out):
-        result = _get_jobs_resources_bulk(["88888_3"])
-    assert result["88888_3"]["max_rss"] == "8M"
-    assert result["88888_3"]["cpu_eff"] == "25%"  # 0.5h / 2.0h
-
-
-def test_get_jobs_resources_bulk_caches_result():
-    """sacct is called only once; subsequent calls for the same ID use the cache."""
-    _clear_cache("RES_CACHED")
-    sacct_out = "RES_CACHED|4096K|01:00:00|04:00:00\n"
-    with _mock_subprocess(sacct_out) as mock_run:
-        _get_jobs_resources_bulk(["RES_CACHED"])
-        _get_jobs_resources_bulk(["RES_CACHED"])
-    assert mock_run.call_count == 1
-
-
-def test_get_jobs_resources_bulk_empty_input():
-    result = _get_jobs_resources_bulk([])
-    assert result == {}
+def test_sanitise_nodelist_rejects_empty_and_none():
+    assert _sanitise_nodelist("") is None
+    assert _sanitise_nodelist(None) is None
 
 
 # --- _exec_alf_binary data.h5 backup ---

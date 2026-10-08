@@ -69,7 +69,7 @@ DEFAULT_HOURS_PER_BIN = 1.0
 
 @dataclass
 class ChainStatus:
-    """Plain data describing one chain's progress. Rendered by CLI and, later, TUI."""
+    """Plain data describing one chain's progress."""
 
     chain_id: str
     sim_dir: str

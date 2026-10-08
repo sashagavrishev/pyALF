@@ -14,7 +14,6 @@ __copyright__ = "Copyright 2020-2025, The ALF Project"
 __license__ = "GPL"
 
 import contextlib
-import json
 import logging
 import os
 import shutil
@@ -23,7 +22,6 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from datetime import datetime
 from itertools import repeat
 from pathlib import Path
 from typing import Any, Literal, TypedDict
@@ -49,8 +47,8 @@ logger = logging.getLogger(__name__)
 # too low to run the fan-out concurrently at all), and a ceiling of 32 avoids
 # oversubscribing a very large machine for what is still I/O-bound work.
 # Below _MIN_FANOUT items the pool costs more to start than the I/O it would
-# overlap. Shared by any caller that probes many sim directories at once --
-# the TUI monitor and :class:`py_alf.campaign.Campaign` both do.
+# overlap. Shared by any caller that probes many sim directories at once,
+# such as :class:`py_alf.campaign.Campaign`.
 _MAX_IO_WORKERS = min(32, max(8, os.cpu_count() or 16))
 _MIN_FANOUT = 3
 
@@ -391,7 +389,7 @@ def _project_root() -> Path:
     """Walk up from CWD to find the project root, identified by .git or common markers.
 
     Falls back to CWD when no root is found (e.g. outside any repository).
-    This anchors .alfmonitor like .git — always at the repo root, never scattered
+    This anchors .pyalf like .git — always at the repo root, never scattered
     across sub-directories depending on where the script was launched from.
     """
     markers = {".git", "pyproject.toml", "setup.py", "setup.cfg"}
@@ -451,8 +449,6 @@ def _exec_alf_binary(
     """Execute the ALF binary already present in *sim_dir*.
 
     Single source of truth for how an ALF job is launched on a worker node.
-    Called by both :func:`_run_alf` (via submitit) and
-    :class:`~py_alf.monitor._SessionEntry` (for resubmissions from the TUI).
     """
     from .simulation import cd
 
@@ -545,66 +541,6 @@ def _slurm_time_to_minutes(value: int | str) -> int:
             "or a string in HH:MM:SS / D-HH:MM:SS format."
         )
     return int(hours * 60)
-
-
-def write_session_manifest(
-    submitted: list[Simulation],
-    job_ids: list[str],
-    cs: ClusterSubmitter,
-    executor: str,
-) -> Path | None:
-    """Write a JSON record of the submitted sims to ``cs.submit_dir``.
-
-    The manifest is what :meth:`SimulationMonitor.from_session` and the
-    ``alf_monitor`` CLI read to reattach to a previous submission, so writing
-    one after a programmatic :meth:`ClusterSubmitter.submit` makes script-driven
-    jobs trackable by the monitor TUI without keeping the submitting process
-    alive. Returns the manifest path, or ``None`` on error.
-    """
-    entries = [
-        {
-            "sim_dir": str(sim.sim_dir),
-            "job_id": jid,
-            "ham_name": sim.ham_name,
-            "n_omp": sim.n_omp,
-            "n_mpi": getattr(sim, "n_mpi", 1),
-            "mpi": getattr(sim, "mpi", False),
-            "mpiexec": getattr(sim, "mpiexec", "mpiexec"),
-            "mpiexec_args": getattr(sim, "mpiexec_args", []),
-            "sim_dict": dict(
-                sim.sim_dict[0] if isinstance(sim.sim_dict, list) else sim.sim_dict
-            ),
-            "config": getattr(sim, "config", ""),
-            "alf_dir": str(getattr(getattr(sim, "alf_src", None), "alf_dir", ".")),
-        }
-        for sim, jid in zip(submitted, job_ids)
-    ]
-    cs_record: dict = {
-        "executor": executor,
-        "submit_dir": str(cs.submit_dir),
-        "slurm_mem": cs.slurm_mem,
-        "partition_rules": cs.partition_rules,
-        "job_name": cs.job_name,
-        "mail_type": cs.mail_type,
-        "wckey": cs.wckey,
-        "stderr_to_stdout": cs.stderr_to_stdout,
-        "slurm_kwargs": cs.slurm_kwargs,
-    }
-    manifest = {
-        "version": 1,
-        "submitted_at": datetime.now().isoformat(timespec="seconds"),
-        "cluster_submitter": cs_record,
-        "entries": entries,
-    }
-    out_path = (
-        cs.submit_dir / f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    )
-    try:
-        cs.submit_dir.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(manifest, indent=2, default=str))
-        return out_path
-    except Exception:
-        return None
 
 
 class ClusterSubmitter:
@@ -743,7 +679,7 @@ class ClusterSubmitter:
         self.submit_dir = (
             Path(submit_dir).resolve()
             if submit_dir is not None
-            else (_project_root() / ".alfmonitor")
+            else (_project_root() / ".pyalf")
         )
         self.slurm_mem = slurm_mem
         self.partition_rules: dict[str, PartitionSpec] | None = partition_rules
@@ -831,7 +767,6 @@ class ClusterSubmitter:
         job_properties: dict[str, Any] | None = None,
         submit_dir: str | Path | None = None,
         confirm_checkpoint: bool = True,
-        write_session: bool = True,
         runner: Callable[[Simulation], None] | None = None,
         prep: bool = True,
         stale_running: Literal["ask", "remove", "skip"] = "ask",
@@ -854,12 +789,6 @@ class ClusterSubmitter:
         submit_dir : str or Path, optional
             Directory for submitit logs and state for this submission.
             Overrides the instance-level ``submit_dir`` set at construction.
-        write_session : bool, default=True
-            For the ``slurm`` executor, write a ``session_*.json`` manifest into
-            the submit directory so the submission can be reattached later with
-            :meth:`SimulationMonitor.from_session` / the ``alf_monitor`` CLI.
-            The interactive TUI sets this to ``False`` because it writes its own
-            manifest from the newly-submitted subset.
         runner : callable, optional
             Function submitit executes on the worker, called with one
             ``Simulation``. Defaults to :func:`_run_alf`, which execs the binary
@@ -1134,15 +1063,6 @@ class ClusterSubmitter:
         # Write job IDs for compatibility with get_status / get_status_all.
         for s, job in zip(filtered_sims, jobs):
             Path(s.sim_dir, "jobid.txt").write_text(job.job_id)
-
-        # Durable session manifest so the monitor TUI / alf_monitor CLI can
-        # reattach to this submission after the submitting process exits.
-        if write_session and self.executor == "slurm" and jobs:
-            manifest_path = write_session_manifest(
-                filtered_sims, [j.job_id for j in jobs], self, self.executor
-            )
-            if manifest_path is not None:
-                logger.info(f"Wrote session manifest: {manifest_path}")
 
         logger.info(f"Submitted {len(jobs)} job(s): {[j.job_id for j in jobs]}")
         return jobs
@@ -1495,8 +1415,6 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
     return status_map
 
 
-_resource_cache: dict[str, dict[str, str | None]] = {}
-
 _submitit_timeout_cache: dict[str, tuple[bool, bool]] = {}
 
 # Terminal SLURM states are immutable, so they are cached per job ID and never
@@ -1553,85 +1471,6 @@ _TERMINAL_STATES: frozenset[str] = frozenset(
         "PREEMPTED",
     }
 )
-
-
-def _get_jobs_resources_bulk(
-    jobids: list[str],
-) -> dict[str, dict[str, str | None]]:
-    """Return peak memory and CPU efficiency for a list of completed job IDs.
-
-    Results are cached per job ID — completed-job accounting data is immutable.
-    Each entry maps to ``{'max_rss': str|None, 'cpu_eff': str|None}``.
-    """
-    to_query = [jid for jid in jobids if jid not in _resource_cache]
-    if to_query:
-        parents: dict[str, None] = {}
-        for jid in to_query:
-            p = jid.rsplit("_", 1)
-            parents[p[0] if len(p) == 2 and p[1].isdigit() else jid] = None
-
-        task_rss_gb: dict[str, float] = {}
-        task_total_h: dict[str, float] = {}
-        task_cpu_h: dict[str, float] = {}
-
-        try:
-            proc = subprocess.run(
-                [
-                    "sacct",
-                    "-j",
-                    ",".join(parents),
-                    "--format=JobID,MaxRSS,TotalCPU,CPUTime",
-                    "--noheader",
-                    "--array",
-                    "--parsable2",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            for line in proc.stdout.strip().splitlines():
-                # --parsable2 uses "|" as delimiter; empty fields stay as empty
-                # strings (no column misalignment when MaxRSS is unset)
-                cols = line.split("|")
-                if len(cols) < 4:
-                    continue
-                raw_jid, rss_str, total_cpu_str, cpu_time_str = cols[:4]
-                canonical = raw_jid.split(".")[0]
-                if canonical not in to_query:
-                    continue
-                try:
-                    gb = _parse_mem_gb(rss_str.strip())
-                    if gb > 0:
-                        task_rss_gb[canonical] = max(
-                            task_rss_gb.get(canonical, 0.0), gb
-                        )
-                except ValueError:
-                    pass
-                if "." not in raw_jid:
-                    h_total = _parse_slurm_time_hours(total_cpu_str)
-                    h_alloc = _parse_slurm_time_hours(cpu_time_str)
-                    if h_total is not None:
-                        task_total_h[canonical] = h_total
-                    if h_alloc is not None:
-                        task_cpu_h[canonical] = h_alloc
-        except Exception as e:
-            logger.debug("sacct resource query failed: %s", e)
-
-        for jid in to_query:
-            entry: dict[str, str | None] = {"max_rss": None, "cpu_eff": None}
-            gb = task_rss_gb.get(jid)
-            if gb:
-                entry["max_rss"] = f"{gb:.2g}G" if gb >= 1 else f"{gb * 1024:.0f}M"
-            h_total = task_total_h.get(jid)
-            h_alloc = task_cpu_h.get(jid)
-            if h_total is not None and h_alloc and h_alloc > 0:
-                entry["cpu_eff"] = f"{100 * h_total / h_alloc:.0f}%"
-            _resource_cache[jid] = entry
-
-    return {
-        jid: _resource_cache.get(jid, {"max_rss": None, "cpu_eff": None})
-        for jid in jobids
-    }
 
 
 def get_status_all(

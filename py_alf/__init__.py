@@ -22,26 +22,7 @@ __all__ = [
     "SegmentPlan",
     "SegmentPolicy",
     "detect_partition_rules",
-    "SubmissionReview",
-    "save_for_ssh",
 ]
-
-_LAZY: dict[str, tuple[str, str]] = {
-    "SubmissionReview": (".submission_tui", "SubmissionReview"),
-    "save_for_ssh": (".submission_tui", "save_for_ssh"),
-    "list_sessions": (".monitor", "list_sessions"),
-    "load_session_sims": (".monitor", "load_session_sims"),
-}
-
-
-def __getattr__(name: str):
-    if name in _LAZY:
-        module_path, attr = _LAZY[name]
-        from importlib import import_module  # noqa: PLC0415
-
-        module = import_module(module_path, package=__package__)
-        return getattr(module, attr)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def check_warmup(*args, gui="tk", **kwargs):

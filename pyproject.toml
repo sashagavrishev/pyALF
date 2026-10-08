@@ -39,12 +39,11 @@ dependencies = [
   "Jinja2",
   "submitit",
   "tabulate2",
-  "textual>=0.70",
   "tqdm",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4.4", "pytest-asyncio>=1.2.0"]
+dev = ["pytest>=7.4.4"]
 doc = [
   "sphinxcontrib-svg2pdfconverter",
   "jupyter-book<2.0",
@@ -62,7 +61,6 @@ Issues = "https://github.com/ALF-QMC/pyALF/issues"
 "ALF Homepage" = "https://alf.physik.uni-wuerzburg.de/"
 
 [project.scripts]
-alf_monitor = 'py_alf.cli.alf_monitor:_main'
 alf_bin_count = 'py_alf.cli.alf_bin_count:_main'
 alf_del_bins = 'py_alf.cli.alf_del_bins:_main'
 alf_postprocess = 'py_alf.cli.alf_postprocess:_main'
@@ -70,14 +68,6 @@ alf_run = 'py_alf.cli.alf_run:_main'
 alf_show_obs = 'py_alf.cli.alf_show_obs:_main'
 alf_test_branch = 'py_alf.cli.alf_test_branch:_main'
 minimal_ALF_run = 'py_alf.cli.minimal_ALF_run:_main'
-
-[dependency-groups]
-dev = [
-    "pytest-asyncio>=1.2.0",
-]
-
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
 
 [tool.ruff.lint]
 select = [

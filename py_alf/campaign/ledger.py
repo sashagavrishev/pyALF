@@ -2,8 +2,8 @@
 
 The ledger is the campaign's index. It maps every ``chain_id`` to its
 Monte-Carlo seed, ``sim_dir``, grid coordinates (``point``) and job history,
-which is what lets a later process -- ``reconcile``, an analysis script, a
-TUI -- pick up a run it did not submit. It also answers the reverse question,
+which is what lets a later process -- ``reconcile``, an analysis script --
+pick up a run it did not submit. It also answers the reverse question,
 "which chain sits at grid coordinate X", that a per-chain result needs to be
 traced back (:meth:`Ledger.by_point_key`).
 

@@ -115,7 +115,7 @@ cython_debug/
 # Project Specific Settings
 ALF
 ALF_data
-.alfmonitor/
+.pyalf/
 TODO.md
 docs/_build
 dist/
