@@ -583,6 +583,79 @@ def test_caching_an_unfinished_chain_agrees_with_a_full_read(tmp_path):
     assert run(deep=True) == truth
 
 
+# --- job folders: one per array under jobs_dir ------------------------------
+
+
+def _status_in_job_folders(tmp_path, segments, logs, state="FAILED"):
+    """Status of one chain whose array logs live under ``jobs_dir/k/<array>``."""
+    led = _ledger(tmp_path)
+    led.data["chains"]["a"] = {
+        "sim_dir": str(tmp_path / "sim"),
+        "point": {},
+        "array_key": "k",
+        "segments": [{"job_id": j} for j in segments],
+    }
+    led.save()
+    for job_id, text in logs.items():
+        folder = tmp_path / "jobs" / "k" / job_id.split("_")[0]
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{job_id}_0_log.out").write_text(text)
+
+    camp = _campaign(tmp_path)
+    camp.jobs_dir = tmp_path / "jobs"
+    with (
+        patch(
+            "py_alf.campaign.campaign.job_states",
+            return_value={segments[-1]: {"status": state}},
+        ),
+        patch(
+            "py_alf.campaign.campaign.read_bin_counts",
+            side_effect=lambda paths, *a, **k: [10] * len(paths),
+        ),
+    ):
+        return camp.status(Ledger.load(tmp_path / "c.json"))[0]
+
+
+def test_status_reads_a_requeued_jobs_log_from_its_array_folder(tmp_path):
+    """A requeue keeps its job id, so its log stays in the same array folder."""
+    got = _status_in_job_folders(
+        tmp_path, ["5101_0"], {"5101_0": "... this job is timed-out ..."}
+    )
+    assert got.timed_out
+    assert got.last_state == "TIMEOUT"
+
+
+def test_status_reads_the_resubmitted_arrays_log_not_the_first(tmp_path):
+    """reconcile's new array has a new id, hence its own folder."""
+    got = _status_in_job_folders(
+        tmp_path,
+        ["5201_0", "5202_0"],
+        {"5201_0": "... this job is timed-out ...", "5202_0": "Traceback ..."},
+    )
+    assert not got.timed_out
+    assert got.last_state == "FAILED"
+
+
+def test_launch_submits_each_array_into_its_own_folder_template(tmp_path):
+    chains = [_chain(tmp_path, "a", 0, array_key="L8"), _chain(tmp_path, "b", 0)]
+    camp, sub = _launch_campaign(tmp_path, chains, jobs_dir=tmp_path / "jobs")
+    camp.launch(verbose=False)
+
+    assert [c["submit_dir"] for c in sub.calls] == [
+        tmp_path / "jobs" / "L8" / "%A",
+        tmp_path / "jobs" / "k" / "%A",
+    ]
+    assert camp.job_folder("L8", "1001_0") == tmp_path / "jobs" / "L8" / "1001"
+
+
+def test_without_jobs_dir_files_stay_in_the_submitters_folder(tmp_path):
+    camp, sub = _launch_campaign(tmp_path, [_chain(tmp_path, "a", 0)])
+    camp.launch(verbose=False)
+
+    assert sub.calls[0]["submit_dir"] is None
+    assert camp.job_folder("k", "1001_0") == tmp_path / "submit"
+
+
 # --- the progress hook -------------------------------------------------------
 
 

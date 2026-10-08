@@ -7,6 +7,8 @@ import logging
 import subprocess
 from pathlib import Path
 
+from submitit.core.utils import JobPaths
+
 logger = logging.getLogger(__name__)
 
 
@@ -230,7 +232,7 @@ _submitit_timeout_cache: dict[str, tuple[bool, bool]] = {}
 _terminal_status_cache: dict[str, dict[str, str | None]] = {}
 
 
-def is_timeout(jobid: str, submit_dir: str | Path, status: str = "FAILED") -> bool:
+def is_timeout(jobid: str, folder: str | Path, status: str = "FAILED") -> bool:
     """Return True if a FAILED or COMPLETED job was actually a wall-time timeout.
 
     submitit can cause SLURM to misreport the terminal state in two ways:
@@ -246,7 +248,7 @@ def is_timeout(jobid: str, submit_dir: str | Path, status: str = "FAILED") -> bo
     cached = _submitit_timeout_cache.get(jobid)
     if cached is None:
         text: str | None = None
-        log_path = Path(submit_dir) / f"{jobid}_0_log.out"
+        log_path = job_log(jobid, folder)
         # Suppressing the read covers the missing file, so no separate exists().
         with contextlib.suppress(OSError):
             text = log_path.read_text(errors="replace")
@@ -282,31 +284,11 @@ TERMINAL_STATES: frozenset[str] = frozenset(
 )
 
 
-def job_log(
-    jobid: str,
-    root_dir: list[str] | None = None,
-    submit_dir: str | Path | None = None,
-) -> Path | None:
-    if root_dir is None:
-        root_dir = ["."]
-    if jobid is None:
-        logger.info("No job ID provided for logfile search.")
-        return None
+def job_log(jobid: str, folder: str | Path, stream: str = "out") -> Path:
+    """Path of submitit's ``stdout`` (or ``err``) log for *jobid* in *folder*.
 
-    # submitit names logs as {jobid}_{task_id}_log.out; task_id is always 0.
-    if submit_dir is not None:
-        submitit_log = Path(submit_dir) / f"{jobid}_0_log.out"
-        if submitit_log.exists():
-            return submitit_log
-
-    # Legacy SLURM-template naming: job-{jobid}.log (underscores → dashes).
-    all_matches = []
-    for dir in root_dir:
-        pattern = f"job-{jobid.replace('_', '-')}.log"
-        all_matches.extend(Path(dir).rglob(pattern))
-    if not all_matches:
-        logger.error(f"Could not find logfile for job {jobid} in {root_dir}")
-        return None
-    if len(all_matches) != 1:
-        logger.warning(f"Multiple logfiles found for job {jobid} in {root_dir}")
-    return all_matches[0]
+    *folder* is the ``submit_dir`` the job was submitted with; a ``%A``/``%j``
+    template is resolved for this job.
+    """
+    paths = JobPaths(folder, job_id=jobid)
+    return paths.stdout if stream == "out" else paths.stderr

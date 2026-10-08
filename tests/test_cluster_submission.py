@@ -1,6 +1,8 @@
 """Tests for ClusterSubmitter in py_alf.cluster_submission."""
 
+import operator
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -910,3 +912,35 @@ def test_init_submit_dir_absolute_stays_unchanged():
     )
     assert cs.submit_dir == Path("/abs/path").resolve()
     assert cs.submit_dir.is_absolute()
+
+
+# --- submit_dir templates, end to end on the local executor ---
+
+
+def test_submit_into_an_array_folder_template_runs_locally(tmp_path):
+    """A %A template becomes one real folder per job; no literal %A is made by us."""
+    alf_dir = tmp_path / "ALF"
+    (alf_dir / "Prog").mkdir(parents=True)
+    (alf_dir / "Prog" / "ALF.out").touch()
+    sim = SimpleNamespace(
+        sim_dir=str(tmp_path / "sim0"),
+        sim_dict={"CPU_MAX": 0.1},
+        ham_name="Hubbard",
+        n_omp=1,
+        n_mpi=1,
+        mpi=False,
+        run=None,
+        alf_src=SimpleNamespace(alf_dir=str(alf_dir)),
+    )
+    template = tmp_path / "jobs" / "L8" / "%A"
+
+    cs = ClusterSubmitter("local", submit_dir=tmp_path / "default")
+    # The worker process must be able to import the runner, so no test-local one.
+    (job,) = cs.submit(
+        sim, submit_dir=template, runner=operator.attrgetter("sim_dir"), prep=False
+    )
+
+    assert job.result() == sim.sim_dir
+    folder = tmp_path / "jobs" / "L8" / job.job_id
+    assert (folder / f"{job.job_id}_0_log.out").exists()
+    assert not (tmp_path / "default").exists()

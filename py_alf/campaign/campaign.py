@@ -106,6 +106,9 @@ class Campaign:
     # them, since ``ledger_path`` already says where this campaign lives.
     experiment: str = ""
     env_name: str = ""
+    # Each array's submitit files go to ``jobs_dir/<array_key>/<array id>/``;
+    # None leaves them in the submitter's own ``submit_dir``.
+    jobs_dir: Path | None = None
 
     # --- construction -------------------------------------------------------
 
@@ -343,6 +346,7 @@ class Campaign:
             sims=[c.sim for c in chains],
             job_properties=job_properties,
             max_requeues=max(1, attempts),
+            submit_dir=None if self.jobs_dir is None else self.jobs_dir / key / "%A",
             runner=run_segment,
             prep=False,
             # launch has already left out every chain with an active job, so a
@@ -370,6 +374,12 @@ class Campaign:
             )
         if verbose:
             print(f"    array {jobs[0].job_id.split('_')[0]}")
+
+    def job_folder(self, array_key: str, job_id: str) -> Path:
+        """Folder holding submitit's files for *job_id*, from array *array_key*."""
+        if self.jobs_dir is None:
+            return Path(self.submitter.submit_dir)
+        return self.jobs_dir / array_key / job_id.split("_")[0]
 
     def _job_name(self, key: str) -> str | None:
         if self.job_name_prefix is None:
@@ -468,7 +478,6 @@ class Campaign:
         if on_progress is not None and all_jobs:
             on_progress(0, "slurm")
         states = job_states(all_jobs) if all_jobs else {}
-        submit_dir = self.submitter.submit_dir
         bins_by_id = self._resolve_bins(
             ledger, states, deep=deep, on_progress=on_progress
         )
@@ -494,8 +503,9 @@ class Campaign:
             if segments and segments[-1].get("job_id"):
                 jid = segments[-1]["job_id"]
                 last_state = (states.get(jid) or {}).get("status")
-                if last_state in {"FAILED", "COMPLETED"} and submit_dir is not None:
-                    timed_out = is_timeout(jid, submit_dir, status=last_state)
+                if last_state in {"FAILED", "COMPLETED"}:
+                    folder = self.job_folder(record.get("array_key", ""), jid)
+                    timed_out = is_timeout(jid, folder, status=last_state)
                     if timed_out:
                         last_state = "TIMEOUT"
 

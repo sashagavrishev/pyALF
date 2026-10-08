@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Literal, TypedDict
 
 import submitit
+from submitit.core.utils import JobPaths
 
 from .execute import exec_alf_binary
 from .simulation import Simulation
@@ -458,8 +459,9 @@ class ClusterSubmitter:
             Override default SLURM parameters. Keys must match
             ``executor.update_parameters()`` keyword arguments.
         submit_dir : str or Path, optional
-            Directory for submitit logs and state for this submission.
-            Overrides the instance-level ``submit_dir`` set at construction.
+            Directory for submitit logs and state for this submission, which
+            may contain submitit's ``%A``/``%j`` placeholders. Overrides the
+            instance-level ``submit_dir`` set at construction.
         runner : callable, optional
             Function submitit executes on the worker, called with one
             ``Simulation``. Defaults to :func:`~py_alf.execute.exec_alf_binary`, which execs the binary
@@ -619,7 +621,10 @@ class ClusterSubmitter:
         effective_submit_dir = (
             Path(submit_dir) if submit_dir is not None else self.submit_dir
         )
-        effective_submit_dir.mkdir(parents=True, exist_ok=True)
+        # A %A/%j template is filled in per job; create only the part before it.
+        JobPaths.get_first_id_independent_folder(effective_submit_dir).mkdir(
+            parents=True, exist_ok=True
+        )
 
         # submitit takes the requeue budget when the executor is constructed.
         executor_kwargs: dict[str, Any] = {}

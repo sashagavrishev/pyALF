@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from py_alf.slurm import _sanitise_nodelist, job_log
+from py_alf.slurm import _sanitise_nodelist, is_timeout, job_log
 
 
 @pytest.fixture(autouse=True)
@@ -18,29 +18,27 @@ def _clear_status_caches():
     yield
 
 
-# --- log helpers ---
+# --- job_log ---
 
 
-def test_find_job_log_submitit(tmp_path):
-    """job_log returns the submitit-named log when submit_dir is provided."""
-    submit_dir = tmp_path / "logs"
-    submit_dir.mkdir()
-    log_file = submit_dir / "42_0_0_log.out"
-    log_file.write_text("output")
-
-    result = job_log("42_0", submit_dir=submit_dir)
-    assert result == log_file
+def test_job_log_names_submitits_stdout_in_a_flat_folder(tmp_path):
+    assert job_log("42_0", tmp_path) == tmp_path / "42_0_0_log.out"
+    assert job_log("42_0", tmp_path, stream="err") == tmp_path / "42_0_0_log.err"
 
 
-def test_find_job_log_falls_back_to_legacy(tmp_path):
-    """job_log falls back to the job-*.log glob when no submitit log exists."""
-    sim_dir = tmp_path / "sim"
-    sim_dir.mkdir()
-    legacy_log = sim_dir / "job-42.log"
-    legacy_log.write_text("output")
+def test_job_log_fills_in_an_array_folder_template(tmp_path):
+    """One folder per array: %A is the array id, shared by all its tasks."""
+    template = tmp_path / "jobs" / "L8" / "%A"
+    assert job_log("4811203_7", template) == (
+        tmp_path / "jobs" / "L8" / "4811203" / "4811203_7_0_log.out"
+    )
 
-    result = job_log("42", root_dir=[str(sim_dir)])
-    assert result == legacy_log
+
+def test_is_timeout_reads_the_log_through_the_template(tmp_path):
+    folder = tmp_path / "jobs" / "L8" / "77"
+    folder.mkdir(parents=True)
+    (folder / "77_1_0_log.out").write_text("... this job is timed-out ...")
+    assert is_timeout("77_1", tmp_path / "jobs" / "L8" / "%A")
 
 
 # --- job_states parent-ID queries ---
