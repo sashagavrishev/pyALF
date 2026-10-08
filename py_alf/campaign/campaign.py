@@ -379,7 +379,6 @@ class Campaign:
             job_properties=job_properties,
             runner=run_segment,
             prep=False,
-            confirm_checkpoint=False,
             # A campaign runs unattended, and ``submit`` has just confirmed via
             # sacct that no job holds these directories, so a leftover RUNNING
             # is debris from an interrupted attempt rather than a live process.

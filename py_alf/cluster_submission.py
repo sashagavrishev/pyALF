@@ -755,10 +755,9 @@ class ClusterSubmitter:
         sims: Simulation | Iterable[Simulation],
         job_properties: dict[str, Any] | None = None,
         submit_dir: str | Path | None = None,
-        confirm_checkpoint: bool = True,
         runner: Callable[[Simulation], None] | None = None,
         prep: bool = True,
-        stale_running: Literal["ask", "remove", "skip"] = "ask",
+        stale_running: Literal["remove", "skip"] = "skip",
     ) -> list[submitit.Job]:
         """
         Submit one or more Simulation instances to the SLURM cluster.
@@ -792,13 +791,10 @@ class ClusterSubmitter:
             happen each time it starts, not once when it was queued. The ALF
             binary is copied into the simulation directory either way, so the
             worker can rely on it being there.
-        stale_running : {'ask', 'remove', 'skip'}, default='ask'
+        stale_running : {'remove', 'skip'}, default='skip'
             What to do with a ``RUNNING`` file left behind by a previous run
-            whose job is no longer active. ``'ask'`` prompts on stdin;
-            ``'remove'`` deletes it and submits anyway; ``'skip'`` leaves the
-            simulation out. An unattended caller (cron, a driver that has
-            already established from ``sacct`` that nothing is running) must not
-            use ``'ask'``, which would block forever on a closed stdin.
+            whose job is no longer active: ``'skip'`` leaves the simulation out,
+            ``'remove'`` deletes the file and submits anyway.
 
         Returns
         -------
@@ -848,22 +844,14 @@ class ClusterSubmitter:
                     if status_entry.get("status") == "RUNNING":
                         logger.info(f"Skipping {s.sim_dir}: job {jobid} is RUNNING")
                         continue
-                logger.warning(f"Leftover RUNNING file detected in {s.sim_dir}.")
-                logger.warning("This indicates an error in the previous run.")
-                if stale_running == "ask":
-                    choice = (
-                        input("Remove RUNNING file to enable resubmission? [y/N]: ")
-                        .strip()
-                        .lower()
-                    )
-                    remove = choice in ("yes", "y")
-                else:
-                    remove = stale_running == "remove"
-                if remove:
+                if stale_running == "remove":
                     running_file.unlink()
-                    logger.info("File removed.")
+                    logger.warning(f"Removed a leftover RUNNING file in {s.sim_dir}.")
                 else:
-                    logger.info(f"Skipping {s.sim_dir}.")
+                    logger.warning(
+                        f"Skipping {s.sim_dir}: leftover RUNNING file from a "
+                        "previous run (pass stale_running='remove' to clear it)."
+                    )
                     continue
 
             filtered_sims.append(s)
@@ -871,22 +859,6 @@ class ClusterSubmitter:
         if not filtered_sims:
             logger.info("No inactive simulations to submit.")
             return []
-
-        if confirm_checkpoint:
-            checkpoint_sims = [
-                s for s in filtered_sims if any(Path(s.sim_dir).glob("confin_*"))
-            ]
-            if checkpoint_sims:
-                names = ", ".join(Path(s.sim_dir).name for s in checkpoint_sims[:3])
-                if len(checkpoint_sims) > 3:
-                    names += f" … ({len(checkpoint_sims)} total)"
-                print(
-                    f"Checkpoint restart detected: {names}\n"
-                    "ALF will append to existing data.h5 instead of starting fresh."
-                )
-                choice = input("Continue? [Y/n]: ").strip().lower()
-                if choice in ("n", "no"):
-                    return []
 
         sim = filtered_sims[0]
 
@@ -978,17 +950,6 @@ class ClusterSubmitter:
             params.update(job_properties)
         if "slurm_time" in params:
             params["slurm_time"] = _slurm_time_to_minutes(params["slurm_time"])
-        # Migrate legacy unprefixed slurm parameters a caller may have supplied;
-        # submitit deprecates them in favour of the slurm_-prefixed forms and
-        # warns when they are passed to update_parameters().
-        if "use_srun" in params:
-            params.setdefault("slurm_use_srun", params.pop("use_srun"))
-        if "additional_parameters" in params:
-            _legacy = params.pop("additional_parameters") or {}
-            params["slurm_additional_parameters"] = {
-                **_legacy,
-                **(params.get("slurm_additional_parameters") or {}),
-            }
 
         if self.executor == "slurm":
             extra = dict(params.get("slurm_additional_parameters") or {})

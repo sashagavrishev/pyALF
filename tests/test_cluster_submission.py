@@ -266,6 +266,32 @@ def test_submit_skips_pending_job(tmp_path):
     assert jobs == []
 
 
+def test_submit_skips_leftover_running_file_by_default(tmp_path):
+    """A stale RUNNING file keeps the sim out, without prompting."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    (tmp_path / "sim0" / "RUNNING").write_text("")
+
+    with _patch_submitit(MagicMock()) as mock_executor:
+        cs = ClusterSubmitter("local", submit_dir=tmp_path / "logs")
+        assert cs.submit(sim) == []
+
+    mock_executor.return_value.submit.assert_not_called()
+    assert (tmp_path / "sim0" / "RUNNING").exists()
+
+
+def test_submit_removes_leftover_running_file_when_asked(tmp_path):
+    sim = _make_mock_sim(tmp_path / "sim0")
+    (tmp_path / "sim0" / "RUNNING").write_text("")
+    mock_job = MagicMock()
+    mock_job.job_id = "1"
+
+    with _patch_submitit(mock_job):
+        cs = ClusterSubmitter("local", submit_dir=tmp_path / "logs")
+        assert cs.submit(sim, stale_running="remove") == [mock_job]
+
+    assert not (tmp_path / "sim0" / "RUNNING").exists()
+
+
 def test_submit_local_does_not_check_slurm_status(tmp_path):
     """Local executor never calls sacct even if a jobid.txt exists."""
     sim = _make_mock_sim(tmp_path / "sim0")
