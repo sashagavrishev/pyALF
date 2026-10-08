@@ -1,42 +1,70 @@
 """Tests for launching the ALF binary in py_alf.execute."""
 
+import contextlib
 from unittest.mock import patch
+
+import h5py
+import numpy as np
+import pytest
 
 from py_alf.execute import exec_alf_binary
 
-# --- exec_alf_binary data.h5 backup ---
+# --- exec_alf_binary: fresh start versus resume ---
 
 
-def test_exec_alf_binary_backs_up_data_on_fresh_run(tmp_path):
-    """data.h5 is renamed before a fresh run (no confin_* present)."""
-    data = tmp_path / "data.h5"
-    data.write_bytes(b"old")
-    binary = tmp_path / "ALF.out"
-    binary.touch()
+def _data_h5(sim_dir, n_bins):
+    """A data.h5 shaped like ALF's: parameters plus one observable's bins."""
+    with h5py.File(sim_dir / "data.h5", "w") as f:
+        f.create_group("parameters")
+        f.create_dataset("Ener_scal/obser", data=np.zeros((n_bins, 1, 2)))
 
+
+@contextlib.contextmanager
+def _no_shell():
+    """Stub out configure.sh and the ALF process; yield the process mock."""
     with (
-        patch("subprocess.run"),
-        patch.dict("os.environ", {"SLURM_JOB_ID": "99999"}, clear=False),
+        patch("py_alf.execute.getenv", return_value={}),
+        patch("py_alf.execute.subprocess.run") as run,
     ):
+        yield run
+
+
+def test_exec_alf_binary_refuses_to_start_over_existing_bins(tmp_path):
+    """ALF would append a second, independent chain to these bins."""
+    _data_h5(tmp_path, 3)
+    (tmp_path / "ALF.out").touch()
+
+    with _no_shell() as run, pytest.raises(RuntimeError):
         exec_alf_binary(tmp_path, n_omp=1, n_mpi=1, mpi=False)
 
-    assert not data.exists(), "data.h5 should have been renamed"
-    assert (tmp_path / "data_99999.h5").exists(), "backup file should exist"
+    run.assert_not_called()
+    assert (tmp_path / "data.h5").exists()
 
 
-def test_exec_alf_binary_preserves_data_on_checkpoint_restart(tmp_path):
-    """data.h5 is left untouched when confin_* files are present."""
-    data = tmp_path / "data.h5"
-    data.write_bytes(b"accumulated")
-    (tmp_path / "confin_0").touch()
-    binary = tmp_path / "ALF.out"
-    binary.touch()
+def test_exec_alf_binary_clears_a_data_file_with_no_bins(tmp_path):
+    """A run that died before its first bin left only parameters behind."""
+    _data_h5(tmp_path, 0)
+    (tmp_path / "ALF.out").touch()
 
-    with patch("subprocess.run"):
+    with _no_shell() as run:
         exec_alf_binary(tmp_path, n_omp=1, n_mpi=1, mpi=False)
 
-    assert data.exists(), "data.h5 must not be touched during checkpoint restart"
-    assert data.read_bytes() == b"accumulated"
+    run.assert_called_once()
+    assert not (tmp_path / "data.h5").exists()
+
+
+def test_exec_alf_binary_resumes_onto_existing_bins(tmp_path):
+    """With a checkpoint, ALF appends to data.h5, which must be left alone."""
+    _data_h5(tmp_path, 3)
+    (tmp_path / "confin_0.h5").touch()
+    (tmp_path / "ALF.out").touch()
+
+    with _no_shell() as run:
+        exec_alf_binary(tmp_path, n_omp=1, n_mpi=1, mpi=False)
+
+    run.assert_called_once()
+    with h5py.File(tmp_path / "data.h5", "r") as f:
+        assert f["Ener_scal/obser"].shape[0] == 3
 
 
 def test_exec_alf_binary_passes_extra_env(tmp_path):
@@ -49,15 +77,3 @@ def test_exec_alf_binary_passes_extra_env(tmp_path):
         )
 
     assert run.call_args.kwargs["env"]["ALF_DELAY_K"] == "32"
-
-
-def test_exec_alf_binary_no_backup_when_no_data(tmp_path):
-    """No error and no backup file when data.h5 does not exist."""
-    binary = tmp_path / "ALF.out"
-    binary.touch()
-
-    with patch("subprocess.run"):
-        exec_alf_binary(tmp_path, n_omp=1, n_mpi=1, mpi=False)
-
-    backups = list(tmp_path.glob("data_*.h5"))
-    assert backups == []

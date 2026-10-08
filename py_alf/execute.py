@@ -6,7 +6,33 @@ import os
 import subprocess
 from pathlib import Path
 
+import h5py
+
 from .simulation import Simulation, cd, getenv
+
+
+def _check_fresh_start(sim_dir: Path) -> None:
+    """Refuse to start a second chain on top of an earlier chain's bins.
+
+    ALF appends to an existing ``data.h5`` whether or not it resumes from a
+    checkpoint, so a fresh start there would mix two independent chains. A file
+    with no bins holds only the parameters of a run that died before its first
+    bin, and is removed.
+    """
+    data_file = sim_dir / "data.h5"
+    if not data_file.exists() or any(sim_dir.glob("confin_*")):
+        return
+    with h5py.File(data_file, "r", locking=False) as f:
+        has_bins = any(
+            isinstance(obs, h5py.Group) and "obser" in obs and obs["obser"].shape[0]
+            for obs in f.values()
+        )
+    if has_bins:
+        raise RuntimeError(
+            f"{data_file} holds bins but {sim_dir} has no confin_* to resume from; "
+            "archive or remove it before starting a new chain there."
+        )
+    data_file.unlink()
 
 
 def exec_alf_binary(
@@ -25,32 +51,13 @@ def exec_alf_binary(
     Single source of truth for how an ALF job is launched on a worker node.
     """
     sim_dir_path = Path(sim_dir)
+    _check_fresh_start(sim_dir_path)
     executable = os.path.join(str(sim_dir), "ALF.out")
     env = getenv(config, alf_dir)
     # Prefer SLURM_CPUS_PER_TASK so OMP_NUM_THREADS exactly matches the
     # allocated CPU slots, which is best practice for hybrid MPI+OpenMP jobs.
     env["OMP_NUM_THREADS"] = os.environ.get("SLURM_CPUS_PER_TASK", str(n_omp))
     env.update(extra_env or {})
-
-    # Guard against overwriting data from a previous independent run.
-    # When confin_* files are present ALF will checkpoint-restart and
-    # accumulate bins into the existing data.h5 — the intended behaviour.
-    # When no confin_* exist ALF starts fresh and would overwrite data.h5.
-    # In that case we archive the old file under the current SLURM job ID
-    # so it is not lost.
-    has_checkpoint = any(
-        name.startswith("confin_") for name in os.listdir(sim_dir_path)
-    )
-    if not has_checkpoint:
-        data_file = sim_dir_path / "data.h5"
-        if data_file.exists():
-            import time as _time
-
-            job_id = os.environ.get("SLURM_ARRAY_JOB_ID") or os.environ.get(
-                "SLURM_JOB_ID"
-            )
-            suffix = job_id if job_id else str(int(_time.time()))
-            data_file.rename(sim_dir_path / f"data_{suffix}.h5")
 
     if mpi:
         cmd: list[str] = [mpiexec, "-n", str(n_mpi), *(mpiexec_args or []), executable]
