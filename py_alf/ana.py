@@ -185,11 +185,12 @@ def error(jacks, imag=False):
 
     """
     N = len(jacks)
+    # Jackknife variance (N-1)/N * sum (x_i - mean)^2 = (N-1) * var.
     m_r = np.mean(jacks.real, axis=0)
-    e_r = np.sqrt(np.var(jacks.real, axis=0) * N)
+    e_r = np.sqrt(np.var(jacks.real, axis=0) * (N - 1))
     if imag:
         m_i = np.mean(jacks.imag, axis=0)
-        e_i = np.sqrt(np.var(jacks.imag, axis=0) * N)
+        e_i = np.sqrt(np.var(jacks.imag, axis=0) * (N - 1))
         return m_r, e_r, m_i, e_i
     return m_r, e_r
 
