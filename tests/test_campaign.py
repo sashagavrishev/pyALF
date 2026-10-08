@@ -24,11 +24,7 @@ from py_alf.campaign.worker import _claim_running, _clear_own_running, run_segme
 from py_alf.simulation import Simulation
 
 # A three-tier cluster of the shape these policies exist to cope with.
-RULES = {
-    "short": {"max_hours": 2},
-    "medium": {"max_hours": 48},
-    "long": {"max_hours": 336},
-}
+RULES = {"short": 2.0, "medium": 48.0, "long": 336.0}
 
 
 # --- SegmentPolicy ----------------------------------------------------------
@@ -1001,7 +997,7 @@ def test_launch_hands_the_array_its_requeue_budget(tmp_path):
 def test_launch_caps_the_budget_with_the_submitter_partition_rules(tmp_path):
     """The policy reads the limits the submitter was built with, not a copy."""
     camp, sub = _launch_campaign(tmp_path, [_chain(tmp_path, "a", 0)])
-    sub.partition_rules = {"medium": {"max_hours": 10.0}}
+    sub.partition_rules = {"medium": 10.0}
     camp.launch(verbose=False)  # 100 bins at 0.1 h would want 13 h
 
     assert sub.calls[0]["sims"][0].sim_dict["CPU_MAX"] == pytest.approx(10.0 * 0.95)

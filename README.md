@@ -21,13 +21,13 @@ from py_alf import ClusterSubmitter
 cs = ClusterSubmitter(
     "slurm",                       # or "local" / "debug"
     slurm_mem="4G",
-    partition_rules={"short": 2, "medium": {"max_hours": 48, "max_cpus": 128}},
+    partition_rules={"short": 2, "medium": 48},   # wall-time limits in hours
     slurm_mail_type="FAIL",        # any other slurm_* option passes through
 )
 jobs = cs.submit(sims)             # one SLURM array for several sims
 ```
 
-- **Partitions:** each `partition_rules` value is hours, or a `PartitionSpec` with `max_hours` and optional `max_cpus` / `max_mem_gb` limits that the submitter enforces.
+- **Partitions:** `partition_rules` maps each partition to its wall-time limit in hours; SLURM itself rejects a request that no node can hold.
 - **Wall time:** `CPU_MAX` plus 10% so ALF can finish its last bin, capped at the limit of the smallest partition that fits `CPU_MAX`.
 - **Filtering:** sims whose `jobid.txt` names an active job are skipped (`skip_active=False` to trust the caller), as are those with a leftover `RUNNING` file (`stale_running="remove"` clears it).
 - **Other options:** `runner=` replaces what runs on the node, `prep=False` leaves directory preparation to it, and `max_requeues=` sets submitit's requeue budget.
@@ -82,7 +82,7 @@ Under submitit a wall-clock stop is recorded as `FAILED` or `CANCELLED`, never `
 
 | Module | Contents |
 |---|---|
-| `cluster_submission` | `ClusterSubmitter`, `PartitionSpec` |
+| `cluster_submission` | `ClusterSubmitter` |
 | `campaign` | `Campaign`, `Chain`, `ChainStatus`, `Ledger`, `SegmentPolicy`, `chain_id`, `ledger_path` |
 | `slurm` | `job_states`, `queued_arrays`, `is_timeout`, `job_log`, `cancel`, `ACTIVE_STATES`, `TERMINAL_STATES` |
 | `bins` | `read_bin_count`, `read_bin_counts` |

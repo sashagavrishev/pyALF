@@ -42,7 +42,7 @@ class SegmentPolicy:
         if not partition_rules:
             return float("inf")
         try:
-            limit = float(partition_rules[self.max_partition]["max_hours"])
+            limit = float(partition_rules[self.max_partition])
         except (KeyError, TypeError) as exc:
             raise SystemExit(
                 f"SegmentPolicy.max_partition={self.max_partition!r} is not in this "

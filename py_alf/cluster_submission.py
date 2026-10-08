@@ -11,7 +11,7 @@ import os
 import shutil
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal
 
 import submitit
 from submitit.core.utils import JobPaths
@@ -21,80 +21,6 @@ from .simulation import Simulation
 from .slurm import ACTIVE_STATES, job_states
 
 logger = logging.getLogger(__name__)
-
-
-class PartitionSpec(TypedDict, total=False):
-    """One partition's limits, a value of ``ClusterSubmitter(partition_rules=)``.
-
-    A bare number stands for ``max_hours`` alone.
-
-    max_hours : float
-        Wall-time limit in hours (required).
-    max_cpus : int, optional
-        CPUs per node; a job needing more (``n_mpi * n_omp``) is refused.
-    max_mem_gb : float, optional
-        Memory per node; a larger ``slurm_mem`` is refused.
-    """
-
-    max_hours: float
-    max_cpus: int
-    max_mem_gb: float
-
-
-def _parse_mem_gb(mem_str: str) -> float:
-    """Parse a SLURM-style memory string into GB.
-
-    Accepted suffixes (case-insensitive): K, M, G, T.
-    No suffix → megabytes (SLURM's default unit for ``--mem``).
-
-    Examples
-    --------
-    >>> _parse_mem_gb("8G")
-    8.0
-    >>> _parse_mem_gb("512M")
-    0.5
-    >>> _parse_mem_gb("1T")
-    1024.0
-    """
-    s = mem_str.strip()
-    if not s:
-        raise ValueError("Empty memory string")
-    suffix = s[-1].upper() if s[-1].isalpha() else ""
-    try:
-        num = float(s[:-1]) if suffix else float(s)
-    except ValueError as err:
-        raise ValueError(f"Cannot parse memory string: {mem_str!r}") from err
-    factors: dict[str, float] = {
-        "K": 1 / 1024**2,  # KB → GB
-        "M": 1 / 1024,  # MB → GB
-        "G": 1.0,
-        "T": 1024.0,  # TB → GB
-        "": 1 / 1024,  # no suffix = MB (SLURM default)
-    }
-    if suffix not in factors:
-        raise ValueError(f"Unknown memory suffix {suffix!r} in {mem_str!r}")
-    return num * factors[suffix]
-
-
-def _normalise_partition_spec(
-    name: str, value: float | int | PartitionSpec | dict
-) -> PartitionSpec:
-    """Coerce a *partition_rules* value to a :class:`PartitionSpec` dict."""
-    if isinstance(value, (int, float)):
-        return PartitionSpec(max_hours=float(value))
-    d = dict(value)
-    if "max_hours" not in d:
-        raise ValueError(
-            f"partition_rules[{name!r}]: dict entries must contain 'max_hours'; "
-            f"got keys {sorted(d)!r}"
-        )
-    unknown = set(d) - {"max_hours", "max_cpus", "max_mem_gb"}
-    if unknown:
-        raise ValueError(
-            f"partition_rules[{name!r}]: unknown keys {sorted(unknown)!r}; "
-            f"valid keys are 'max_hours', 'max_cpus', 'max_mem_gb'"
-        )
-    return PartitionSpec(**d)
 
 
 def _project_root() -> Path:
@@ -134,9 +60,9 @@ class ClusterSubmitter:
         Where submitit writes job files; defaults to ``.pyalf`` at the project root.
     slurm_mem : str
         Memory per node, e.g. ``'8G'``. Required for SLURM.
-    partition_rules : dict[str, float | PartitionSpec]
-        Partition name to limits. Required for SLURM. Each job goes to the
-        partition with the smallest ``max_hours`` that fits its wall time.
+    partition_rules : dict[str, float]
+        Partition name to its wall-time limit in hours. Required for SLURM.
+        Each job goes to the partition with the smallest limit that fits it.
     job_name : str, optional
         Job name. Defaults to the Hamiltonian name.
     **executor_params
@@ -192,11 +118,12 @@ class ClusterSubmitter:
         if partition_rules is not None:
             try:
                 partition_rules = {
-                    name: _normalise_partition_spec(name, spec)
-                    for name, spec in partition_rules.items()
+                    name: float(hours) for name, hours in partition_rules.items()
                 }
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"Invalid partition_rules: {exc}") from exc
+                raise ValueError(
+                    f"partition_rules maps each partition to its hours: {exc}"
+                ) from exc
 
         self.executor = executor
         self.submit_dir = (
@@ -205,20 +132,17 @@ class ClusterSubmitter:
             else (_project_root() / ".pyalf")
         )
         self.slurm_mem = slurm_mem
-        self.partition_rules: dict[str, PartitionSpec] | None = partition_rules
+        self.partition_rules: dict[str, float] | None = partition_rules
         self.job_name = job_name
         self.executor_params = executor_params
 
     def _select_partition(self, timeout_hours: float) -> str:
         """Select the smallest-limit partition that accommodates *timeout_hours*."""
-        for name, spec in sorted(
-            self.partition_rules.items(), key=lambda kv: kv[1]["max_hours"]
-        ):
-            if timeout_hours <= spec["max_hours"]:
+        for name, limit in sorted(self.partition_rules.items(), key=lambda kv: kv[1]):
+            if timeout_hours <= limit:
                 return name
         configured = ", ".join(
-            f"{n}: {_format_hours(s['max_hours'])}"
-            for n, s in self.partition_rules.items()
+            f"{n}: {_format_hours(h)}" for n, h in self.partition_rules.items()
         )
         raise ValueError(
             f"No configured partition fits a {_format_hours(timeout_hours)} timeout. "
@@ -244,44 +168,8 @@ class ClusterSubmitter:
                 "derived; set CPU_MAX."
             )
         partition = self._select_partition(cpu_max)
-        hours = min(cpu_max * 1.1, float(self.partition_rules[partition]["max_hours"]))
+        hours = min(cpu_max * 1.1, self.partition_rules[partition])
         return int(hours * 60), partition
-
-    def _check_node_fit(
-        self,
-        sim: Simulation,
-        partition: str,
-        slurm_mem: str | None = None,
-    ) -> None:
-        """Raise :class:`ValueError` if *sim*'s CPUs or the memory request
-        (*slurm_mem*, else the instance's) exceed *partition*'s per-node limits."""
-        spec = self.partition_rules[partition]
-
-        total_cpus = (sim.n_mpi if sim.mpi else 1) * sim.n_omp
-        max_cpus = spec.get("max_cpus")
-        if max_cpus is not None and total_cpus > max_cpus:
-            detail = (
-                f"n_mpi={sim.n_mpi} × n_omp={sim.n_omp}"
-                if sim.mpi
-                else f"n_omp={sim.n_omp}"
-            )
-            raise ValueError(
-                f"Requested {total_cpus} CPU(s) ({detail}) exceeds "
-                f"partition '{partition}' per-node CPU limit of {max_cpus}."
-            )
-
-        effective_mem = slurm_mem if slurm_mem is not None else self.slurm_mem
-        max_mem_gb = spec.get("max_mem_gb")
-        if max_mem_gb is not None and effective_mem:
-            try:
-                req_gb = _parse_mem_gb(effective_mem)
-            except ValueError:
-                return  # unparseable → skip
-            if req_gb > max_mem_gb:
-                raise ValueError(
-                    f"Requested memory {effective_mem} ({req_gb:.3g} GB) exceeds "
-                    f"partition '{partition}' per-node memory limit of {max_mem_gb} GB."
-                )
 
     @staticmethod
     def _active_jobs(sims: list[Simulation]) -> dict[str, str]:
@@ -427,7 +315,6 @@ class ClusterSubmitter:
         if self.executor == "slurm":
             params["slurm_mem"] = self.slurm_mem
             params["slurm_partition"] = partition
-            self._check_node_fit(sim, partition)
             if sim.mpi:
                 # submitit's srun would start one launcher per task slot, each
                 # running its own mpiexec (submitit#1757); one launcher calls

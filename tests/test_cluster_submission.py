@@ -9,8 +9,6 @@ import pytest
 
 from py_alf.cluster_submission import (
     ClusterSubmitter,
-    _normalise_partition_spec,
-    _parse_mem_gb,
 )
 from py_alf.execute import exec_alf_binary
 from py_alf.simulation import Simulation
@@ -27,11 +25,8 @@ def test_init_defaults():
     assert cs.submit_dir.name == ".pyalf"
     assert cs.submit_dir.is_absolute()
     assert cs.slurm_mem == "2G"
-    # partition_rules is normalised to PartitionSpec dicts at construction time
-    assert cs.partition_rules == {
-        "short": {"max_hours": 8.0},
-        "long": {"max_hours": 168.0},
-    }
+    # partition_rules is normalised to float hours at construction time
+    assert cs.partition_rules == {"short": 8.0, "long": 168.0}
     assert cs.job_name is None
     assert cs.executor_params == {}
 
@@ -47,7 +42,7 @@ def test_init_custom():
     assert cs.submit_dir == Path("/tmp/logs").resolve()
     assert cs.executor == "slurm"
     assert cs.slurm_mem == "8G"
-    assert cs.partition_rules == {"gpu": {"max_hours": 24.0}}
+    assert cs.partition_rules == {"gpu": 24.0}
     assert cs.executor_params == {"slurm_extra": "foo"}
 
 
@@ -102,6 +97,11 @@ def test_init_job_name_and_stderr_accepted_for_local():
     cs = ClusterSubmitter("local", job_name="my-job", stderr_to_stdout=True)
     assert cs.job_name == "my-job"
     assert cs.executor_params == {"stderr_to_stdout": True}
+
+
+def test_init_rejects_a_partition_rule_that_is_not_hours():
+    with pytest.raises(ValueError, match="hours"):
+        ClusterSubmitter(slurm_mem="2G", partition_rules={"short": {"max_hours": 2}})
 
 
 # --- _select_partition ---
@@ -546,270 +546,6 @@ def _patch_submitit(job_or_jobs, multi=False):
     else:
         mock_executor.return_value.submit.return_value = job_or_jobs
     return patch("py_alf.cluster_submission.submitit.AutoExecutor", mock_executor)
-
-
-# --- _parse_mem_gb ---
-
-
-def test_parse_mem_gb_gigabytes():
-    assert _parse_mem_gb("8G") == pytest.approx(8.0)
-
-
-def test_parse_mem_gb_megabytes():
-    assert _parse_mem_gb("512M") == pytest.approx(0.5)
-
-
-def test_parse_mem_gb_terabytes():
-    assert _parse_mem_gb("1T") == pytest.approx(1024.0)
-
-
-def test_parse_mem_gb_kilobytes():
-    # 1024 KB = 1 MB = 1/1024 GB
-    assert _parse_mem_gb("1024K") == pytest.approx(1.0 / 1024)
-
-
-def test_parse_mem_gb_no_suffix_is_megabytes():
-    # SLURM default: no suffix means MB
-    assert _parse_mem_gb("256") == pytest.approx(256 / 1024)
-
-
-def test_parse_mem_gb_empty_raises():
-    with pytest.raises(ValueError):
-        _parse_mem_gb("")
-
-
-def test_parse_mem_gb_bad_value_raises():
-    with pytest.raises(ValueError):
-        _parse_mem_gb("badval")
-
-
-# --- PartitionSpec normalisation ---
-
-
-def test_normalise_plain_float_returns_max_hours_dict():
-    spec = _normalise_partition_spec("short", 2.0)
-    assert spec == {"max_hours": 2.0}
-
-
-def test_normalise_plain_int_returns_float_max_hours():
-    spec = _normalise_partition_spec("short", 8)
-    assert spec == {"max_hours": 8.0}
-    assert isinstance(spec["max_hours"], float)
-
-
-def test_normalise_full_dict_passes_through():
-    spec = _normalise_partition_spec(
-        "short", {"max_hours": 2, "max_cpus": 64, "max_mem_gb": 128}
-    )
-    assert spec["max_hours"] == 2
-    assert spec["max_cpus"] == 64
-    assert spec["max_mem_gb"] == 128
-
-
-def test_normalise_partial_dict_max_hours_only():
-    spec = _normalise_partition_spec("short", {"max_hours": 8})
-    assert spec == {"max_hours": 8}
-
-
-def test_normalise_missing_max_hours_raises():
-    with pytest.raises(ValueError, match="max_hours"):
-        _normalise_partition_spec("short", {"max_cpus": 64})
-
-
-def test_normalise_unknown_key_raises():
-    with pytest.raises(ValueError, match="unknown"):
-        _normalise_partition_spec("short", {"max_hours": 8, "bogus_key": 1})
-
-
-def test_init_accepts_plain_float_spec():
-    """Plain float is backward-compatible; ClusterSubmitter must accept it."""
-    cs = ClusterSubmitter(slurm_mem="2G", partition_rules={"short": 2.0})
-    assert "short" in cs.partition_rules
-
-
-def test_init_accepts_plain_int_spec():
-    """Plain int is backward-compatible; ClusterSubmitter must accept it."""
-    cs = ClusterSubmitter(slurm_mem="2G", partition_rules={"short": 8})
-    assert "short" in cs.partition_rules
-
-
-def test_init_accepts_full_dict_spec():
-    cs = ClusterSubmitter(
-        slurm_mem="2G",
-        partition_rules={"short": {"max_hours": 2, "max_cpus": 64, "max_mem_gb": 128}},
-    )
-    assert "short" in cs.partition_rules
-
-
-def test_init_accepts_partial_dict_spec():
-    cs = ClusterSubmitter(slurm_mem="2G", partition_rules={"short": {"max_hours": 8}})
-    assert "short" in cs.partition_rules
-
-
-def test_init_rejects_dict_missing_max_hours():
-    with pytest.raises(ValueError, match="max_hours"):
-        ClusterSubmitter(slurm_mem="2G", partition_rules={"short": {"max_cpus": 64}})
-
-
-def test_init_rejects_dict_with_unknown_key():
-    with pytest.raises(ValueError):
-        ClusterSubmitter(
-            slurm_mem="2G",
-            partition_rules={"short": {"max_hours": 8, "bogus_key": 1}},
-        )
-
-
-# --- _select_partition still works after normalisation ---
-
-
-def test_select_partition_with_plain_float_rules():
-    """Plain float specs are still usable for partition selection."""
-    cs = ClusterSubmitter(slurm_mem="2G", partition_rules={"short": 2, "long": 48})
-    assert cs._select_partition(1) == "short"
-    assert cs._select_partition(2) == "short"
-    assert cs._select_partition(3) == "long"
-    assert cs._select_partition(48) == "long"
-
-
-def test_select_partition_with_dict_rules():
-    """Dict specs with max_hours are usable for partition selection."""
-    cs = ClusterSubmitter(
-        slurm_mem="2G",
-        partition_rules={
-            "short": {"max_hours": 2, "max_cpus": 64},
-            "long": {"max_hours": 48, "max_cpus": 128},
-        },
-    )
-    assert cs._select_partition(1) == "short"
-    assert cs._select_partition(2) == "short"
-    assert cs._select_partition(3) == "long"
-    assert cs._select_partition(48) == "long"
-
-
-# --- _check_node_fit ---
-
-
-def test_check_node_fit_cpu_within_limit(tmp_path):
-    sim = _make_mock_sim(tmp_path / "sim0")
-    sim.n_omp = 4
-    sim.mpi = False
-    cs = ClusterSubmitter(
-        slurm_mem="8G",
-        partition_rules={"short": {"max_hours": 8, "max_cpus": 8, "max_mem_gb": 16}},
-    )
-    # n_omp=4 <= max_cpus=8 => no exception
-    cs._check_node_fit(sim, "short")
-
-
-def test_check_node_fit_cpu_exceeds_raises(tmp_path):
-    sim = _make_mock_sim(tmp_path / "sim0")
-    sim.n_omp = 16
-    sim.mpi = False
-    cs = ClusterSubmitter(
-        slurm_mem="8G",
-        partition_rules={"short": {"max_hours": 8, "max_cpus": 8, "max_mem_gb": 16}},
-    )
-    with pytest.raises(ValueError, match="(?i)cpu"):
-        cs._check_node_fit(sim, "short")
-
-
-def test_check_node_fit_mem_within_limit(tmp_path):
-    sim = _make_mock_sim(tmp_path / "sim0")
-    cs = ClusterSubmitter(
-        slurm_mem="8G",
-        partition_rules={"short": {"max_hours": 8, "max_mem_gb": 16}},
-    )
-    # 8 GB <= 16 GB => no exception
-    cs._check_node_fit(sim, "short")
-
-
-def test_check_node_fit_mem_exceeds_raises(tmp_path):
-    sim = _make_mock_sim(tmp_path / "sim0")
-    cs = ClusterSubmitter(
-        slurm_mem="32G",
-        partition_rules={"short": {"max_hours": 8, "max_mem_gb": 16}},
-    )
-    with pytest.raises(ValueError, match="(?i)memory"):
-        cs._check_node_fit(sim, "short")
-
-
-def test_check_node_fit_no_limits_no_exception(tmp_path):
-    """Plain-float spec has no max_cpus or max_mem_gb, so no exception is raised."""
-    sim = _make_mock_sim(tmp_path / "sim0")
-    sim.n_omp = 128
-    cs = ClusterSubmitter(
-        slurm_mem="512G",
-        partition_rules={"short": 8},  # plain float spec => no CPU/mem limits
-    )
-    cs._check_node_fit(sim, "short")
-
-
-def test_check_node_fit_slurm_mem_override_exceeds(tmp_path):
-    """The slurm_mem keyword overrides the instance default when checking memory."""
-    sim = _make_mock_sim(tmp_path / "sim0")
-    cs = ClusterSubmitter(
-        slurm_mem="4G",  # instance default is within limit
-        partition_rules={"short": {"max_hours": 8, "max_mem_gb": 16}},
-    )
-    # Override with a value that exceeds the limit
-    with pytest.raises(ValueError, match="(?i)memory"):
-        cs._check_node_fit(sim, "short", slurm_mem="32G")
-
-
-def test_check_node_fit_slurm_mem_override_within_limit(tmp_path):
-    """slurm_mem override within limit should not raise even if instance default is too large."""
-    sim = _make_mock_sim(tmp_path / "sim0")
-    cs = ClusterSubmitter(
-        slurm_mem="32G",  # instance default exceeds limit
-        partition_rules={"short": {"max_hours": 8, "max_mem_gb": 16}},
-    )
-    # Override with a value that is within the limit => no exception
-    cs._check_node_fit(sim, "short", slurm_mem="4G")
-
-
-# --- submit resource validation ---
-
-
-def test_submit_exceeds_max_cpus_raises_before_executor(tmp_path):
-    """Exceeding max_cpus raises ValueError before submitit is ever invoked."""
-    sim = _make_mock_sim(tmp_path / "sim0")
-    sim.n_omp = 16  # exceeds max_cpus=8
-    sim.mpi = False
-
-    mock_job = MagicMock()
-    mock_job.job_id = "1"
-
-    with _patch_submitit(mock_job) as mock_executor:
-        cs = ClusterSubmitter(
-            submit_dir=tmp_path / "logs",
-            slurm_mem="8G",
-            partition_rules={"short": {"max_hours": 8, "max_cpus": 8}},
-        )
-        with pytest.raises(ValueError, match="(?i)cpu"):
-            cs.submit(sim)
-
-    mock_executor.return_value.submit.assert_not_called()
-    mock_executor.return_value.map_array.assert_not_called()
-
-
-def test_submit_exceeds_max_mem_raises_before_executor(tmp_path):
-    """Exceeding max_mem_gb raises ValueError before submitit is ever invoked."""
-    sim = _make_mock_sim(tmp_path / "sim0")
-
-    mock_job = MagicMock()
-    mock_job.job_id = "1"
-
-    with _patch_submitit(mock_job) as mock_executor:
-        cs = ClusterSubmitter(
-            submit_dir=tmp_path / "logs",
-            slurm_mem="32G",  # exceeds max_mem_gb=16
-            partition_rules={"short": {"max_hours": 8, "max_mem_gb": 16}},
-        )
-        with pytest.raises(ValueError, match="(?i)memory"):
-            cs.submit(sim)
-
-    mock_executor.return_value.submit.assert_not_called()
-    mock_executor.return_value.map_array.assert_not_called()
 
 
 # --- MPI use_srun=False ---
