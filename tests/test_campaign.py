@@ -633,25 +633,23 @@ def test_the_progress_hook_is_optional(tmp_path):
 class _FakeSubmitter:
     """Stands in for ClusterSubmitter, recording what a launch asked for.
 
-    Reproduces the two behaviours ``_submit_array`` depends on: the returned
-    jobs need not line up with the sims passed in (``submit`` drops chains whose
-    previous job is still active), and the pairing is recovered from the
-    ``jobid.txt`` written into each submitted chain's own directory.
+    Like ``submit``, writes each job's id into its chain's own ``jobid.txt``,
+    which is how ``_submit_array`` pairs chains with jobs.
     """
 
-    def __init__(self, submit_dir, holds=()):
+    def __init__(self, submit_dir, executor="local"):
         self.submit_dir = submit_dir
+        self.executor = executor
         self.calls = []
-        self.holds = set(holds)  # sim_dirs whose job is still active
         self._array = 1000
 
     def submit(self, sims, job_properties, **kwargs):
         self._array += 1
-        self.calls.append({"sims": list(sims), "job_properties": dict(job_properties)})
+        self.calls.append(
+            {"sims": list(sims), "job_properties": dict(job_properties), **kwargs}
+        )
         jobs = []
         for i, sim in enumerate(sims):
-            if sim.sim_dir in self.holds:
-                continue
             job_id = f"{self._array}_{i}"
             Path(sim.sim_dir).mkdir(parents=True, exist_ok=True)
             (Path(sim.sim_dir) / "jobid.txt").write_text(job_id)
@@ -680,7 +678,9 @@ def _chain(tmp_path, name, bins, array_key="k", target_bins=100):
 
 
 def _launch_campaign(tmp_path, chains, **kwargs):
-    submitter = _FakeSubmitter(tmp_path / "submit", holds=kwargs.pop("holds", ()))
+    submitter = _FakeSubmitter(
+        tmp_path / "submit", executor=kwargs.pop("executor", "local")
+    )
     camp = Campaign(
         name="c",
         chains=list(chains),
@@ -748,16 +748,22 @@ def test_launch_groups_one_array_per_array_key(tmp_path):
     assert [len(c["sims"]) for c in sub.calls] == [2, 1]
 
 
-def test_launch_records_no_segment_for_a_chain_submit_held_back(tmp_path):
-    """A chain whose previous job is still active keeps its old jobid.txt."""
+def test_launch_leaves_out_a_chain_whose_job_is_still_active(tmp_path):
+    """One bulk query decides; submit is then told not to check again."""
     chains = [_chain(tmp_path, "held", 10), _chain(tmp_path, "free", 10)]
-    (Path(chains[0].sim_dir) / "jobid.txt").write_text("999_9")
-    camp, _ = _launch_campaign(tmp_path, chains, holds=[chains[0].sim_dir])
-    camp.launch(verbose=False)
+    camp, sub = _launch_campaign(tmp_path, chains, executor="slurm")
+    camp.launch(verbose=False)  # one array: held is job 1001_0, free is 1001_1
+    states = {"1001_0": {"status": "RUNNING"}, "1001_1": {"status": "COMPLETED"}}
 
+    with patch("py_alf.campaign.campaign.job_states", return_value=states) as query:
+        camp.launch(verbose=False)
+
+    query.assert_called_once()
+    assert [s.sim_dir for s in sub.calls[1]["sims"]] == [chains[1].sim_dir]
+    assert sub.calls[1]["skip_active"] is False
     ledger = Ledger.load(tmp_path / "c.json")
-    assert ledger.chains["held"]["segments"] == []
-    assert len(ledger.chains["free"]["segments"]) == 1
+    assert len(ledger.chains["held"]["segments"]) == 1
+    assert len(ledger.chains["free"]["segments"]) == 2
 
 
 def test_launch_dry_run_submits_nothing_and_writes_no_ledger(tmp_path):

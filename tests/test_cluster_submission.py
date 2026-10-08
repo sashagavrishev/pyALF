@@ -212,8 +212,8 @@ def test_submit_skips_running_job(tmp_path):
     (tmp_path / "sim0" / "jobid.txt").write_text("7")
 
     with patch(
-        "py_alf.cluster_submission.job_state",
-        return_value={"status": "RUNNING"},
+        "py_alf.cluster_submission.job_states",
+        return_value={"7": {"status": "RUNNING"}},
     ):
         cs = ClusterSubmitter(
             submit_dir=tmp_path / "logs", slurm_mem="2G", partition_rules=_RULES
@@ -229,8 +229,8 @@ def test_submit_skips_pending_job(tmp_path):
     (tmp_path / "sim0" / "jobid.txt").write_text("7")
 
     with patch(
-        "py_alf.cluster_submission.job_state",
-        return_value={"status": "PENDING"},
+        "py_alf.cluster_submission.job_states",
+        return_value={"7": {"status": "PENDING"}},
     ):
         cs = ClusterSubmitter(
             submit_dir=tmp_path / "logs", slurm_mem="2G", partition_rules=_RULES
@@ -238,6 +238,47 @@ def test_submit_skips_pending_job(tmp_path):
         jobs = cs.submit(sim)
 
     assert jobs == []
+
+
+def test_submit_queries_slurm_once_for_many_sims(tmp_path):
+    """The active check is one bulk query, not one sacct call per sim."""
+    sims = []
+    for i in range(3):
+        sim = _make_mock_sim(tmp_path / f"sim{i}")
+        (tmp_path / f"sim{i}" / "jobid.txt").write_text(f"7_{i}")
+        sims.append(sim)
+    states = {"7_0": {"status": "RUNNING"}, "7_1": {"status": "COMPLETED"}}
+
+    with (
+        patch("py_alf.cluster_submission.job_states", return_value=states) as query,
+        _patch_submitit(
+            [MagicMock(job_id="8_0"), MagicMock(job_id="8_1")], multi=True
+        ) as mock_executor,
+    ):
+        cs = ClusterSubmitter(
+            submit_dir=tmp_path / "logs", slurm_mem="2G", partition_rules=_RULES
+        )
+        cs.submit(sims)
+
+    query.assert_called_once()
+    submitted = mock_executor.return_value.map_array.call_args.args[1]
+    assert [s.sim_dir for s in submitted] == [sims[1].sim_dir, sims[2].sim_dir]
+
+
+def test_submit_skip_active_false_trusts_the_caller(tmp_path):
+    sim = _make_mock_sim(tmp_path / "sim0")
+    (tmp_path / "sim0" / "jobid.txt").write_text("7")
+
+    with (
+        patch("py_alf.cluster_submission.job_states") as query,
+        _patch_submitit(MagicMock(job_id="8")),
+    ):
+        cs = ClusterSubmitter(
+            submit_dir=tmp_path / "logs", slurm_mem="2G", partition_rules=_RULES
+        )
+        assert len(cs.submit(sim, skip_active=False)) == 1
+
+    query.assert_not_called()
 
 
 def test_submit_skips_leftover_running_file_by_default(tmp_path):
@@ -276,7 +317,7 @@ def test_submit_local_does_not_check_slurm_status(tmp_path):
 
     with (
         _patch_submitit(mock_job) as _mock_executor,
-        patch("py_alf.cluster_submission.job_state") as mock_sacct,
+        patch("py_alf.cluster_submission.job_states") as mock_sacct,
     ):
         cs = ClusterSubmitter("local", submit_dir=tmp_path / "logs")
         jobs = cs.submit(sim)

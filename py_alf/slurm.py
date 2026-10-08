@@ -39,44 +39,6 @@ def _normalise_state(raw: str) -> str:
     return state
 
 
-def job_state(jobid: str) -> dict[str, str | None]:
-    """
-    Query SLURM sacct for job status, elapsed time, and allocated node.
-    Returns dict: {'status': ..., 'runtime': ..., 'nodelist': ...}
-    """
-    try:
-        result = subprocess.run(
-            [
-                "sacct",
-                "-j",
-                jobid,
-                "--format=State,Elapsed,NodeList",
-                "--noheader",
-                "--array",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        lines = result.stdout.strip().splitlines()
-        logger.debug(lines)
-        for line in lines:
-            parts = line.split()
-            if len(parts) >= 1:
-                state = _normalise_state(parts[0])
-                runtime = parts[1] if len(parts) > 1 else None
-                raw_node = parts[2] if len(parts) > 2 else None
-                return {
-                    "status": state,
-                    "runtime": runtime,
-                    "nodelist": _sanitise_nodelist(raw_node),
-                }
-        return {"status": "UNKNOWN", "runtime": None, "nodelist": None}
-    except Exception as e:
-        logger.error(f"sacct error for job {jobid}: {e}")
-        return {"status": "ERROR", "runtime": None, "nodelist": None}
-
-
 def _parent_ids(jobids: list[str]) -> list[str]:
     """Return the distinct array-parent IDs behind *jobids*, preserving order.
 

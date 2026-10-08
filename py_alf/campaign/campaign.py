@@ -228,10 +228,12 @@ class Campaign:
             env_name=self.env_name,
         )
         ledger.upsert_chains(self.chains)
+        active = self._active_chain_ids(ledger)
 
         rules = self.partition_rules
         for key, chains in self.groups().items():
-            runnable = self._runnable(chains, bins or {})
+            idle = [c for c in chains if c.chain_id not in active]
+            runnable = self._runnable(idle, bins or {})
             if not runnable:
                 if verbose:
                     print(f"[{key or self.name}] nothing to submit.")
@@ -273,13 +275,28 @@ class Campaign:
                 print(f"Ledger: {ledger.path}")
         return ledger
 
+    def _active_chain_ids(self, ledger: Ledger) -> set[str]:
+        """Chains with a segment SLURM still holds, from one bulk query."""
+        if self.submitter.executor != "slurm":
+            return set()
+        records = {c.chain_id: ledger.chains[c.chain_id] for c in self.chains}
+        jobs = [
+            s["job_id"]
+            for record in records.values()
+            for s in record.get("segments", [])
+            if s.get("job_id")
+        ]
+        if not jobs:
+            return set()
+        states = job_states(jobs)
+        return {
+            cid for cid, record in records.items() if _has_active_job(record, states)
+        }
+
     def _runnable(
         self, chains: list[Chain], known: dict[str, int]
     ) -> list[tuple[Chain, int]]:
         """Chains short of the target, each with the bin count that decided it.
-
-        Chains still held by SLURM are dropped by ``ClusterSubmitter.submit``
-        itself, which reads each ``jobid.txt`` and skips PENDING/RUNNING jobs.
 
         The count is returned rather than recomputed by the caller: sizing the
         array's budget needs the same number, and re-reading the whole grid to
@@ -332,17 +349,16 @@ class Campaign:
             job_properties=job_properties,
             runner=run_segment,
             prep=False,
-            # A campaign runs unattended, and ``submit`` has just confirmed via
-            # sacct that no job holds these directories, so a leftover RUNNING
-            # is debris from an interrupted attempt rather than a live process.
+            # launch has already left out every chain with an active job, so a
+            # leftover RUNNING is debris from an interrupted attempt.
+            skip_active=False,
             stale_running="remove",
         )
         if not jobs:
             return
 
-        # ``submit`` drops chains whose job is still active, so the returned
-        # list need not line up with ``chains``. It writes each submitted job's
-        # id into that chain's own jobid.txt, which is the reliable pairing.
+        # Pair each chain with its job through the jobid.txt ``submit`` wrote
+        # into the chain's own directory.
         submitted = {job.job_id for job in jobs}
         for chain in chains:
             jobid_file = Path(chain.sim_dir) / "jobid.txt"

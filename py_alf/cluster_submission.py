@@ -24,7 +24,7 @@ import submitit
 
 from .execute import exec_alf_binary
 from .simulation import Simulation
-from .slurm import job_state
+from .slurm import ACTIVE_STATES, job_states
 
 logger = logging.getLogger(__name__)
 
@@ -406,6 +406,23 @@ class ClusterSubmitter:
                     f"partition '{partition}' per-node memory limit of {max_mem_gb} GB."
                 )
 
+    @staticmethod
+    def _active_jobs(sims: list[Simulation]) -> dict[str, str]:
+        """``sim_dir -> job id`` for each sim whose recorded job is still active."""
+        jobids = {}
+        for s in sims:
+            jobid_file = Path(s.sim_dir) / "jobid.txt"
+            if jobid_file.exists():
+                jobids[s.sim_dir] = jobid_file.read_text().strip()
+        if not jobids:
+            return {}
+        states = job_states(list(jobids.values()))
+        return {
+            sim_dir: jid
+            for sim_dir, jid in jobids.items()
+            if (states.get(jid) or {}).get("status") in ACTIVE_STATES
+        }
+
     def submit(
         self,
         sims: Simulation | Iterable[Simulation],
@@ -414,6 +431,7 @@ class ClusterSubmitter:
         runner: Callable[[Simulation], None] | None = None,
         prep: bool = True,
         stale_running: Literal["remove", "skip"] = "skip",
+        skip_active: bool = True,
     ) -> list[submitit.Job]:
         """
         Submit one or more Simulation instances to the SLURM cluster.
@@ -451,6 +469,9 @@ class ClusterSubmitter:
             What to do with a ``RUNNING`` file left behind by a previous run
             whose job is no longer active: ``'skip'`` leaves the simulation out,
             ``'remove'`` deletes the file and submits anyway.
+        skip_active : bool, default=True
+            Leave out simulations whose ``jobid.txt`` names a job SLURM still
+            holds. A caller that has already established this passes ``False``.
 
         Returns
         -------
@@ -475,31 +496,20 @@ class ClusterSubmitter:
                     f"Expected Simulation-like object (missing {missing!r}), got {type(s)}"
                 )
 
+        active = (
+            self._active_jobs(sim_list)
+            if skip_active and self.executor == "slurm"
+            else {}
+        )
         filtered_sims = []
 
         for s in sim_list:
-            jobid_file = Path(s.sim_dir) / "jobid.txt"
+            if s.sim_dir in active:
+                logger.info(f"Skipping {s.sim_dir}: job {active[s.sim_dir]} is active")
+                continue
+
             running_file = Path(s.sim_dir) / "RUNNING"
-
-            jobid: str | None = (
-                jobid_file.read_text().strip() if jobid_file.exists() else None
-            )
-
-            if jobid is not None and self.executor == "slurm":
-                status_entry = job_state(jobid)
-                if status_entry.get("status") in ("PENDING", "RUNNING"):
-                    logger.info(
-                        f"Skipping {s.sim_dir}: job {jobid} is \
-                           {status_entry.get('status')}"
-                    )
-                    continue
-
             if running_file.exists():
-                if jobid is not None and self.executor == "slurm":
-                    status_entry = job_state(jobid)
-                    if status_entry.get("status") == "RUNNING":
-                        logger.info(f"Skipping {s.sim_dir}: job {jobid} is RUNNING")
-                        continue
                 if stale_running == "remove":
                     running_file.unlink()
                     logger.warning(f"Removed a leftover RUNNING file in {s.sim_dir}.")
