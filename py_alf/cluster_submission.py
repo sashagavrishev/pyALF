@@ -10,6 +10,7 @@ import hashlib
 import logging
 import os
 import shutil
+import threading
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any, Literal
@@ -17,6 +18,7 @@ from typing import Any, Literal
 import submitit
 from submitit.core.utils import JobPaths
 
+from ._io import map_io
 from .execute import exec_alf_binary
 from .simulation import Simulation
 from .slurm import ACTIVE_STATES, job_states
@@ -317,9 +319,14 @@ class ClusterSubmitter:
         sims = [s for p in packs for s in p]
         _check_sims(sims)
         _check_uniform(sims)
-        for s in sims:
+
+        # Each directory costs a few metadata round trips on a networked
+        # filesystem, which overlap in the pool rather than queue.
+        def _ready(s: Simulation) -> None:
             _clear_stale_running(s, "remove")
             _stage(s, prep=False)
+
+        map_io(_ready, sims)
 
         timeout_min, partition = self._wall_time_for(hours)
         executor = self._executor(
@@ -327,9 +334,14 @@ class ClusterSubmitter:
         )
         jobs = executor.map_array(runner, packs, [hours] * len(packs))
 
-        for pack, job in zip(packs, jobs, strict=True):
-            for s in pack:
-                Path(s.sim_dir, "jobid.txt").write_text(job.job_id)
+        map_io(
+            lambda sj: Path(sj[0].sim_dir, "jobid.txt").write_text(sj[1]),
+            [
+                (s, job.job_id)
+                for pack, job in zip(packs, jobs, strict=True)
+                for s in pack
+            ],
+        )
 
         logger.info(f"Submitted {len(jobs)} pack(s) of {len(sims)} simulations.")
         return jobs
@@ -448,20 +460,23 @@ def _frozen_binary(src: Path, root: Path) -> Path:
     """
     stat = src.stat()
     key = (str(src), stat.st_mtime_ns, stat.st_size, str(root))
-    if key not in _FROZEN:
-        digest = hashlib.sha256(src.read_bytes()).hexdigest()[:16]
-        frozen = root / BINARY_DIR / f"ALF-{digest}.out"
-        if not frozen.exists():
-            frozen.parent.mkdir(parents=True, exist_ok=True)
-            tmp = frozen.with_suffix(f".tmp{os.getpid()}")
-            shutil.copy2(src, tmp)
-            tmp.chmod(0o555)
-            os.replace(tmp, frozen)
-        _FROZEN[key] = frozen
+    with _FROZEN_LOCK:  # staging threads share one copy per build
+        if key not in _FROZEN:
+            digest = hashlib.sha256(src.read_bytes()).hexdigest()[:16]
+            frozen = root / BINARY_DIR / f"ALF-{digest}.out"
+            if not frozen.exists():
+                frozen.parent.mkdir(parents=True, exist_ok=True)
+                tmp = frozen.with_suffix(f".tmp{os.getpid()}")
+                shutil.copy2(src, tmp)
+                tmp.chmod(0o555)
+                os.replace(tmp, frozen)
+            st = frozen.stat()
+            _FROZEN[key] = (frozen, (st.st_dev, st.st_ino))
     return _FROZEN[key]
 
 
-_FROZEN: dict[tuple, Path] = {}
+_FROZEN: dict[tuple, tuple[Path, tuple[int, int]]] = {}
+_FROZEN_LOCK = threading.Lock()
 
 
 def _place_binary(src: Path, sim_dir: Path) -> None:
@@ -471,10 +486,15 @@ def _place_binary(src: Path, sim_dir: Path) -> None:
     a grid of hundreds of thousands of chains; a link costs one metadata write.
     """
     dest = sim_dir / "ALF.out"
-    frozen = _frozen_binary(src, sim_dir.parent)
-    if dest.exists() and dest.samefile(frozen):
-        return
-    dest.unlink(missing_ok=True)
+    frozen, inode = _frozen_binary(src, sim_dir.parent)
+    try:
+        st = dest.stat()
+    except FileNotFoundError:
+        pass
+    else:
+        if (st.st_dev, st.st_ino) == inode:
+            return
+        dest.unlink()
     try:
         os.link(frozen, dest)
     except OSError:

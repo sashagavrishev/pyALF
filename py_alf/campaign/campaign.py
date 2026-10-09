@@ -360,7 +360,8 @@ class Campaign:
                 print(
                     f"[{PACK_FOLDER}] {len(chunk)} pack(s) of "
                     f"{sum(len(p) for p in chunk)} chain(s), "
-                    f"{attempts} attempt(s), {hours:.2f} h each"
+                    f"{attempts} attempt(s), {hours:.2f} h each",
+                    flush=True,
                 )
             if dry_run:
                 continue
@@ -387,6 +388,8 @@ class Campaign:
                     cpu_max_ceiling=float(hours),
                     counting_obs=self.counting_obs,
                 )
+        if verbose:
+            print(f"    staging {sum(len(p) for p in packs):,} chain(s)", flush=True)
         job_name = self._job_name(PACK_FOLDER)
         jobs = self.submitter.submit_packs(
             [[c.sim for c, _, _ in p] for p in packs],
@@ -409,10 +412,10 @@ class Campaign:
                         "jobs_subdir": f"{PACK_FOLDER}/{array}",
                     },
                 )
+        if verbose:
+            print(f"    array {array}; saving the ledger", flush=True)
         # Saved per array, as _submit_array does.
         ledger.save()
-        if verbose:
-            print(f"    array {array}")
 
     def _runnable(
         self, chains: list[Chain], known: dict[str, int]
