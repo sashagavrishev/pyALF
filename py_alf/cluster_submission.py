@@ -369,6 +369,10 @@ class ClusterSubmitter:
         if self.executor == "slurm":
             params["slurm_mem"] = self.slurm_mem
             params["slurm_partition"] = partition
+            # submitit throttles every array to 256 running tasks unless told
+            # otherwise; it caps this at the array's size, so the array runs as
+            # wide as the scheduler allows. A caller may still pass a throttle.
+            params["slurm_array_parallelism"] = UNTHROTTLED
             if sim.mpi:
                 # submitit's srun would start one launcher per task slot, each
                 # running its own mpiexec (submitit#1757); one launcher calls
@@ -400,6 +404,9 @@ class ClusterSubmitter:
 
 
 _SIM_ATTRS = ("sim_dir", "sim_dict", "ham_name", "n_omp", "n_mpi", "mpi", "run")
+
+# Above any MaxArraySize, so submitit's min(tasks, this) is the array's own size.
+UNTHROTTLED = 10**9
 
 
 def _check_sims(sims: list) -> None:

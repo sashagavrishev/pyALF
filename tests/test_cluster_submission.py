@@ -803,3 +803,48 @@ def test_the_binary_is_copied_where_it_cannot_be_linked(tmp_path):
     with patch("py_alf.cluster_submission.os.link", side_effect=OSError("EXDEV")):
         _place_binary(src, d)
     assert (d / "ALF.out").read_bytes() == b"alf-v1"
+
+
+# --- array throttle ---
+
+
+def test_arrays_are_not_throttled_by_submitits_default(tmp_path):
+    """submitit would cap each array at 256 running tasks."""
+    from py_alf.cluster_submission import UNTHROTTLED
+
+    sims = [_pack_sim(tmp_path, n) for n in ("a", "b")]
+    with _patch_submitit([SimpleNamespace(job_id="1_0")], multi=True) as mock_executor:
+        cs = ClusterSubmitter(
+            submit_dir=tmp_path / "logs", slurm_mem="2G", partition_rules=_RULES
+        )
+        cs.submit_packs([sims], 1.0, runner=_runner)
+    params = mock_executor.return_value.update_parameters.call_args.kwargs
+    assert params["slurm_array_parallelism"] == UNTHROTTLED
+
+
+def test_a_caller_may_still_throttle_an_array(tmp_path):
+    with _patch_submitit([SimpleNamespace(job_id="1_0")], multi=True) as mock_executor:
+        cs = ClusterSubmitter(
+            submit_dir=tmp_path / "logs",
+            slurm_mem="2G",
+            partition_rules=_RULES,
+            slurm_array_parallelism=50,
+        )
+        cs.submit_packs([[_pack_sim(tmp_path, "a")]], 1.0, runner=_runner)
+    params = mock_executor.return_value.update_parameters.call_args.kwargs
+    assert params["slurm_array_parallelism"] == 50
+
+
+def test_submitit_turns_the_default_into_an_unthrottled_array_spec(tmp_path):
+    """End to end through submitit's own sbatch rendering, no SLURM needed."""
+    from submitit.slurm.slurm import _make_sbatch_string
+
+    from py_alf.cluster_submission import UNTHROTTLED
+
+    text = _make_sbatch_string(
+        command="true",
+        folder=str(tmp_path),
+        map_count=1000,
+        array_parallelism=UNTHROTTLED,
+    )
+    assert "#SBATCH --array=0-999%1000" in text
