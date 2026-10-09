@@ -644,3 +644,93 @@ def test_submit_into_an_array_folder_template_runs_locally(tmp_path):
     folder = tmp_path / "jobs" / "L8" / job.job_id
     assert (folder / f"{job.job_id}_0_log.out").exists()
     assert not (tmp_path / "default").exists()
+
+
+# --- submit_packs ---
+
+
+def _pack_sim(tmp_path: Path, name: str) -> MagicMock:
+    alf_dir = tmp_path / "ALF"
+    (alf_dir / "Prog").mkdir(parents=True, exist_ok=True)
+    (alf_dir / "Prog" / "ALF.out").touch()
+    sim = _make_mock_sim(tmp_path / name)
+    sim.n_omp = 1
+    sim.alf_src = SimpleNamespace(alf_dir=str(alf_dir))
+    return sim
+
+
+def _runner(pack, hours):
+    """Stand-in pack runner; never called under the mocked executor."""
+
+
+def test_submit_packs_maps_each_pack_with_the_shared_budget(tmp_path):
+    """Task i receives (packs[i], hours); every chain's jobid.txt names its pack."""
+    packs = [
+        [_pack_sim(tmp_path, "a"), _pack_sim(tmp_path, "b")],
+        [_pack_sim(tmp_path, "c")],
+    ]
+    jobs = [SimpleNamespace(job_id="77_0"), SimpleNamespace(job_id="77_1")]
+    with _patch_submitit(jobs, multi=True) as mock_executor:
+        cs = ClusterSubmitter(
+            submit_dir=tmp_path / "logs", slurm_mem="2G", partition_rules=_RULES
+        )
+        assert cs.submit_packs(packs, 2.0, runner=_runner) == jobs
+
+    mock_executor.return_value.map_array.assert_called_once_with(
+        _runner, packs, [2.0, 2.0]
+    )
+    jobids = {
+        name: (tmp_path / name / "jobid.txt").read_text() for name in ("a", "b", "c")
+    }
+    assert jobids == {"a": "77_0", "b": "77_0", "c": "77_1"}
+    assert (tmp_path / "a" / "ALF.out").exists()
+
+
+def test_submit_packs_asks_for_the_budget_plus_ten_percent(tmp_path):
+    with _patch_submitit([SimpleNamespace(job_id="1_0")], multi=True) as mock_executor:
+        cs = ClusterSubmitter(
+            submit_dir=tmp_path / "logs", slurm_mem="2G", partition_rules=_RULES
+        )
+        cs.submit_packs([[_pack_sim(tmp_path, "a")]], 2.0, runner=_runner)
+
+    params = mock_executor.return_value.update_parameters.call_args.kwargs
+    assert params["timeout_min"] == int(2.0 * 1.1 * 60)
+    assert params["slurm_partition"] == "short"
+    assert params["cpus_per_task"] == 1
+
+
+def test_submit_packs_clears_a_leftover_running_file(tmp_path):
+    """The caller has ruled out live jobs, so a leftover RUNNING is stale."""
+    sim = _pack_sim(tmp_path, "a")
+    (tmp_path / "a" / "RUNNING").write_text("")
+    with _patch_submitit([SimpleNamespace(job_id="1_0")], multi=True):
+        cs = ClusterSubmitter(
+            submit_dir=tmp_path / "logs", slurm_mem="2G", partition_rules=_RULES
+        )
+        cs.submit_packs([[sim]], 1.0, runner=_runner)
+    assert not (tmp_path / "a" / "RUNNING").exists()
+
+
+def test_submit_packs_runs_a_pack_locally(tmp_path):
+    """End to end on the local executor: one task gets the whole pack."""
+    sims = [
+        SimpleNamespace(
+            sim_dir=str(tmp_path / name),
+            sim_dict={},
+            ham_name="Hubbard",
+            n_omp=1,
+            n_mpi=1,
+            mpi=False,
+            run=None,
+            alf_src=SimpleNamespace(alf_dir=str(tmp_path / "ALF")),
+        )
+        for name in ("a", "b")
+    ]
+    (tmp_path / "ALF" / "Prog").mkdir(parents=True)
+    (tmp_path / "ALF" / "Prog" / "ALF.out").touch()
+
+    cs = ClusterSubmitter("local", submit_dir=tmp_path / "jobs")
+    # The worker must import the runner, so a builtin stands in for run_pack.
+    (job,) = cs.submit_packs([sims], 0.1, runner=print)
+    assert job.result() is None
+    assert "a" in Path(job.paths.stdout).read_text()

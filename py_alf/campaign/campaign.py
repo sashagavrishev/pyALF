@@ -25,11 +25,15 @@ from ..slurm import (
 )
 from .chain import Chain
 from .ledger import DEFAULT_COUNTING_OBS, Ledger
+from .packing import pack
 from .policy import SegmentPolicy
-from .worker import SegmentPlan, measured_hours_per_bin, run_segment
+from .worker import SegmentPlan, measured_hours_per_bin, run_pack, run_segment
 
 # Progress hook for a long scan: ``(n_settled, phase)``.
 ProgressFn = Callable[[int, str], None]
+
+# Folder under ``jobs_dir`` for pack arrays, and their job-name suffix.
+PACK_FOLDER = "packs"
 
 # Hours per bin for a chain with neither a measurement nor a cost model; it only
 # sizes that chain's first segment.
@@ -201,8 +205,14 @@ class Campaign:
         )
         ledger.upsert_chains(self.chains)
         active = self._active_chain_ids(ledger)
+        active |= self._unrecorded_active(
+            ledger, [c for c in self.chains if c.chain_id not in active]
+        )
 
         rules = self.submitter.partition_rules or {}
+        budget = self.policy.pack_budget(rules)
+        solo: dict[str, list[tuple[Chain, int, float]]] = {}
+        small: list[tuple[Chain, int, float]] = []
         for key, chains in self.groups().items():
             idle = [c for c in chains if c.chain_id not in active]
             runnable = self._runnable(idle, known_bins or {})
@@ -210,10 +220,15 @@ class Campaign:
                 if verbose:
                     print(f"[{key or self.name}] nothing to submit.")
                 continue
+            for chain, bins in runnable:
+                hpb = self.hours_per_bin_for(chain)
+                hours = self.policy.chain_hours(self.target_bins - bins, hpb)
+                if hours < budget:
+                    small.append((chain, bins, hpb))
+                else:
+                    solo.setdefault(key, []).append((chain, bins, hpb))
 
-            plans = [
-                (chain, bins, self.hours_per_bin_for(chain)) for chain, bins in runnable
-            ]
+        for key, plans in solo.items():
             # One array shares one wall-time request, so the array asks for the
             # neediest chain's budget; every worker then trims its own CPU_MAX
             # down from that ceiling.
@@ -228,7 +243,7 @@ class Campaign:
 
             if verbose or dry_run:
                 print(
-                    f"[{key or self.name}] {len(runnable)} chain(s), "
+                    f"[{key or self.name}] {len(plans)} chain(s), "
                     f"{attempts} attempt(s), CPU_MAX ceiling {ceiling:.2f} h"
                 )
             if dry_run:
@@ -240,6 +255,9 @@ class Campaign:
                 continue
 
             self._submit_array(key, plans, ceiling, attempts, rules, ledger, verbose)
+
+        if small:
+            self._launch_packs(small, segments, rules, ledger, dry_run, verbose)
 
         if not dry_run:
             ledger.save()
@@ -266,6 +284,135 @@ class Campaign:
         return {
             cid for cid, record in records.items() if live & set(_segment_jobs(record))
         }
+
+    def _unrecorded_active(self, ledger: Ledger, chains: list[Chain]) -> set[str]:
+        """Chains whose ``jobid.txt`` names a live job the ledger never recorded.
+
+        An interrupted launch can submit an array and stop before saving the
+        ledger; submitting those chains again would run two ALF processes in one
+        directory. The job found is recorded, so later scans see it.
+        """
+        if self.submitter.executor != "slurm" or not chains:
+            return set()
+
+        def _read(chain: Chain) -> tuple[str, str | None]:
+            try:
+                text = (Path(chain.sim_dir) / "jobid.txt").read_text().strip()
+            except OSError:
+                return chain.chain_id, None
+            return chain.chain_id, text or None
+
+        found = {
+            cid: jid
+            for cid, jid in map_io(_read, chains)
+            if jid and jid not in _segment_jobs(ledger.chains[cid])
+        }
+        if not found:
+            return set()
+        states = job_states(sorted(set(found.values())))
+        if any((states.get(j) or {}).get("status") == "ERROR" for j in found.values()):
+            raise RuntimeError(
+                "SLURM did not answer, so it is unknown which jobs are live"
+            )
+        live = {
+            cid
+            for cid, jid in found.items()
+            if (states.get(jid) or {}).get("status") in ACTIVE_STATES
+        }
+        for cid in live:
+            ledger.add_segment(cid, {"job_id": found[cid], "recovered": True})
+        return live
+
+    def _launch_packs(
+        self,
+        plans: list[tuple[Chain, int, float]],
+        segments: int | None,
+        rules: dict,
+        ledger: Ledger,
+        dry_run: bool,
+        verbose: bool,
+    ) -> None:
+        """Submit chains shorter than the pack budget as packs, one task each.
+
+        Packs are sorted by length and cut into arrays of ``max_array_tasks``,
+        each asking for its longest pack, so similar packs share a request.
+        """
+        policy = self.policy
+        sized = [
+            (
+                chain.chain_id,
+                (chain, bins, hpb),
+                policy.chain_hours(self.target_bins - bins, hpb)
+                + policy.pack_overhead_hours,
+            )
+            for chain, bins, hpb in plans
+        ]
+        hours_of = {key: hours for key, _, hours in sized}
+        packs = pack(sized, policy.pack_budget(rules))
+        packs.sort(key=lambda p: -sum(hours_of[c.chain_id] for c, _, _ in p))
+        attempts = segments or policy.max_segments
+        size = policy.max_array_tasks
+        for start in range(0, len(packs), size):
+            chunk = packs[start : start + size]
+            longest = max(sum(hours_of[c.chain_id] for c, _, _ in p) for p in chunk)
+            hours = min(max(policy.min_hours, longest), policy.max_hours(rules))
+            if verbose or dry_run:
+                print(
+                    f"[{PACK_FOLDER}] {len(chunk)} pack(s) of "
+                    f"{sum(len(p) for p in chunk)} chain(s), "
+                    f"{attempts} attempt(s), {hours:.2f} h each"
+                )
+            if dry_run:
+                continue
+            self._submit_packs(chunk, hours, attempts, rules, ledger, verbose)
+
+    def _submit_packs(
+        self,
+        packs: list[list[tuple[Chain, int, float]]],
+        hours: float,
+        attempts: int,
+        rules: dict,
+        ledger: Ledger,
+        verbose: bool,
+    ) -> None:
+        for p in packs:
+            for chain, _, hpb in p:
+                chain.sim.sim_dict = {**chain.sim.sim_dict, "CPU_MAX": float(hours)}
+                chain.sim.segment_plan = SegmentPlan(
+                    target_bins=self.target_bins,
+                    hours_per_bin=hpb,
+                    partition_rules=rules,
+                    policy=self.policy,
+                    chain_id=chain.chain_id,
+                    cpu_max_ceiling=float(hours),
+                    counting_obs=self.counting_obs,
+                )
+        job_name = self._job_name(PACK_FOLDER)
+        jobs = self.submitter.submit_packs(
+            [[c.sim for c, _, _ in p] for p in packs],
+            hours,
+            runner=run_pack,
+            job_properties={} if job_name is None else {"name": job_name},
+            submit_dir=None
+            if self.jobs_dir is None
+            else self.jobs_dir / PACK_FOLDER / "%A",
+            max_requeues=max(1, attempts),
+        )
+        array = jobs[0].job_id.split("_")[0]
+        for p, job in zip(packs, jobs, strict=True):
+            for chain, _, _ in p:
+                ledger.add_segment(
+                    chain.chain_id,
+                    {
+                        "job_id": job.job_id,
+                        "cpu_max_planned": float(hours),
+                        "jobs_subdir": f"{PACK_FOLDER}/{array}",
+                    },
+                )
+        # Saved per array, as _submit_array does.
+        ledger.save()
+        if verbose:
+            print(f"    array {array}")
 
     def _runnable(
         self, chains: list[Chain], known: dict[str, int]
@@ -357,6 +504,18 @@ class Campaign:
         if self.jobs_dir is None:
             return Path(self.submitter.submit_dir)
         return self.jobs_dir / array_key / job_id.split("_")[0]
+
+    def segment_folder(self, record: dict[str, Any], job_id: str) -> Path:
+        """Folder holding *job_id*'s files for the chain *record*.
+
+        A pack's segment names its folder; older segments sit under the chain's
+        ``array_key``.
+        """
+        if self.jobs_dir is not None:
+            for s in record.get("segments", []):
+                if s.get("job_id") == job_id and s.get("jobs_subdir"):
+                    return self.jobs_dir / s["jobs_subdir"]
+        return self.job_folder(record.get("array_key", ""), job_id)
 
     def _job_name(self, key: str) -> str | None:
         if self.job_name_prefix is None:
@@ -470,7 +629,7 @@ class Campaign:
                 jid = segments[-1]["job_id"]
                 last_state = (states.get(jid) or {}).get("status")
                 if last_state in {"FAILED", "COMPLETED"}:
-                    folder = self.job_folder(record.get("array_key", ""), jid)
+                    folder = self.segment_folder(record, jid)
                     timed_out = is_timeout(jid, folder, status=last_state)
                     if timed_out:
                         last_state = "TIMEOUT"
@@ -479,7 +638,8 @@ class Campaign:
                 verdict = "done"
             elif active:
                 verdict = "active"
-            elif not segments:
+            elif not segments or (bins == 0 and _all_cancelled(segments, states)):
+                # A job cancelled before it ran is no sign of a crash.
                 verdict = "unstarted"
             elif bins > 0:
                 verdict = "resumable"
@@ -557,8 +717,7 @@ class Campaign:
         jobs = _segment_jobs(record)
         if not jobs:
             return None
-        folder = self.job_folder(record.get("array_key", ""), jobs[-1])
-        return job_log(jobs[-1], folder, stream)
+        return job_log(jobs[-1], self.segment_folder(record, jobs[-1]), stream)
 
     def _queued_arrays(self) -> set[str]:
         """This user's array ids SLURM still holds; raises if squeue fails."""
@@ -605,7 +764,7 @@ class Campaign:
             return []
         queued = self._queued_arrays()
         latest = {
-            self.job_folder(record.get("array_key", ""), jobs[-1])
+            self.segment_folder(record, jobs[-1])
             for record in Ledger.load(self.ledger_path).chains.values()
             if (jobs := _segment_jobs(record))
         }
@@ -629,6 +788,15 @@ class Campaign:
 def _segment_jobs(record: dict[str, Any]) -> list[str]:
     """Job ids of a chain's segments, oldest first."""
     return [s["job_id"] for s in record.get("segments", []) if s.get("job_id")]
+
+
+def _all_cancelled(segments: list[dict[str, Any]], states: dict[str, dict]) -> bool:
+    """True if every segment was cancelled and none reached its worker's record."""
+    return all(
+        (states.get(s.get("job_id")) or {}).get("status") == "CANCELLED"
+        and "bins_after" not in s
+        for s in segments
+    )
 
 
 def _has_active_job(record: dict[str, Any], states: dict[str, dict]) -> bool:

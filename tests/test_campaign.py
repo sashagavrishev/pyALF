@@ -863,6 +863,25 @@ class _FakeSubmitter:
         self.calls = []
         self._array = 1000
 
+    def submit_packs(self, packs, hours, runner, job_properties, **kwargs):
+        self._array += 1
+        self.calls.append(
+            {
+                "packs": [list(p) for p in packs],
+                "hours": hours,
+                "runner": runner,
+                "job_properties": dict(job_properties),
+                **kwargs,
+            }
+        )
+        jobs = []
+        for i, sims in enumerate(packs):
+            job_id = f"{self._array}_{i}"
+            for sim in sims:
+                (Path(sim.sim_dir) / "jobid.txt").write_text(job_id)
+            jobs.append(SimpleNamespace(job_id=job_id))
+        return jobs
+
     def submit(self, sims, job_properties, **kwargs):
         self._array += 1
         self.calls.append(
@@ -1129,3 +1148,260 @@ def test_reconcile_persists_the_worker_records_it_absorbed(tmp_path):
     on_disk = Ledger.load(tmp_path / "c.json").chains["resumable"]
     assert on_disk["segments"][0]["elapsed_s"] == 1234
     assert on_disk["bins"] == 40
+
+
+# --- packing short chains into shared tasks ----------------------------------
+
+
+def test_pack_respects_capacity_and_isolates_oversized_items():
+    from py_alf.campaign.packing import pack
+
+    items = [(f"c{i}", f"c{i}", h) for i, h in enumerate([1.5, 0.4, 0.4, 0.3, 3.0])]
+    packs = pack(items, capacity=2.0)
+    loads = {tuple(p): sum(h for k, _, h in items if k in p) for p in packs}
+    assert ["c4"] in packs  # 3 h exceeds the 2 h capacity: alone
+    assert all(load <= 2.0 for p, load in loads.items() if p != ("c4",))
+    assert sorted(k for p in packs for k in p) == sorted(k for k, _, _ in items)
+
+
+def test_pack_is_deterministic_and_fills_to_capacity():
+    """Twenty 0.1 h chains fill 2 h exactly, rounding notwithstanding."""
+    from py_alf.campaign.packing import pack
+
+    items = [(f"c{i:03d}", f"c{i:03d}", 0.1) for i in range(100)]
+    assert pack(items, 2.0) == pack(list(reversed(items)), 2.0)
+    assert [len(p) for p in pack(items, 2.0)] == [20] * 5
+
+
+def test_chain_hours_carries_the_safety_factor():
+    assert SegmentPolicy(safety=1.3).chain_hours(10, 0.1) == pytest.approx(1.3)
+
+
+def test_an_old_pickled_policy_reads_packing_as_off():
+    """Arrays queued before packing pickled a SegmentPolicy without its fields."""
+    import pickle
+
+    old = SegmentPolicy.__new__(SegmentPolicy)
+    object.__setattr__(old, "__dict__", {"max_partition": "medium", "safety": 1.3})
+    restored = pickle.loads(pickle.dumps(old))
+    assert restored.pack_hours == 0.0
+    assert restored.max_array_tasks == 1000
+
+
+def _pack_launch(tmp_path, specs, pack_hours=2.0, **kwargs):
+    """A campaign whose chains need ``hours`` each at the pinned 0.1 h/bin."""
+    chains = []
+    for name, (bins, key) in specs.items():
+        chains.append(_chain(tmp_path, name, bins, array_key=key))
+    camp, sub = _launch_campaign(
+        tmp_path,
+        chains,
+        policy=SegmentPolicy(pack_hours=pack_hours, safety=1.0, **kwargs),
+        jobs_dir=tmp_path / "jobs",
+    )
+    return camp, sub
+
+
+def test_launch_packs_short_chains_and_keeps_long_ones_alone(tmp_path):
+    """At 0.1 h/bin: 1 bin left is 0.1 h (packed), 50 left is 5 h (alone)."""
+    camp, sub = _pack_launch(
+        tmp_path, {"s1": (99, "a"), "s2": (99, "b"), "long": (50, "a")}
+    )
+    camp.launch(verbose=False)
+
+    solo = [c for c in sub.calls if "sims" in c]
+    packed = [c for c in sub.calls if "packs" in c]
+    assert [[s.sim_dir for s in c["sims"]] for c in solo] == [[str(tmp_path / "long")]]
+    assert len(packed) == 1
+    assert [sorted(Path(s.sim_dir).name for s in p) for p in packed[0]["packs"]] == [
+        ["s1", "s2"]
+    ]
+    assert packed[0]["runner"].__name__ == "run_pack"
+    assert packed[0]["submit_dir"] == tmp_path / "jobs" / "packs" / "%A"
+
+    ledger = Ledger.load(tmp_path / "c.json")
+    seg = ledger.chains["s1"]["segments"][0]
+    assert seg["job_id"] == ledger.chains["s2"]["segments"][0]["job_id"]
+    assert seg["jobs_subdir"] == f"packs/{seg['job_id'].split('_')[0]}"
+
+
+def test_a_pack_asks_for_its_chains_plus_their_overhead(tmp_path):
+    camp, sub = _pack_launch(
+        tmp_path, {"s1": (95, "a"), "s2": (90, "a")}, pack_overhead_hours=0.05
+    )
+    camp.launch(verbose=False)
+    (call,) = sub.calls
+    assert call["hours"] == pytest.approx(0.5 + 1.0 + 2 * 0.05)
+    plan = call["packs"][0][0].segment_plan
+    assert plan.cpu_max_ceiling == pytest.approx(call["hours"])
+
+
+def test_packs_are_cut_into_arrays_of_bounded_size(tmp_path):
+    specs = {f"c{i}": (99, "k") for i in range(5)}
+    camp, sub = _pack_launch(tmp_path, specs, pack_hours=0.15, max_array_tasks=2)
+    camp.launch(verbose=False)
+    assert [len(c["packs"]) for c in sub.calls] == [2, 2, 1]
+
+
+def test_packing_off_keeps_one_array_per_array_key(tmp_path):
+    camp, sub = _pack_launch(tmp_path, {"s1": (99, "a"), "s2": (99, "b")}, 0.0)
+    camp.launch(verbose=False)
+    assert [len(c["sims"]) for c in sub.calls] == [1, 1]
+
+
+def test_pack_dry_run_submits_nothing(tmp_path):
+    camp, sub = _pack_launch(tmp_path, {"s1": (99, "a")})
+    camp.launch(dry_run=True, verbose=False)
+    assert sub.calls == []
+
+
+def test_a_packed_segment_resolves_to_the_pack_folder(tmp_path):
+    camp, _ = _pack_launch(tmp_path, {"s1": (99, "a")})
+    camp.launch(verbose=False)
+    record = Ledger.load(tmp_path / "c.json").chains["s1"]
+    job_id = record["segments"][0]["job_id"]
+    assert camp.segment_folder(record, job_id) == (
+        tmp_path / "jobs" / "packs" / job_id.split("_")[0]
+    )
+    # A segment from before packing still resolves under its array_key.
+    old = {"array_key": "a", "segments": [{"job_id": "5_0"}]}
+    assert camp.segment_folder(old, "5_0") == tmp_path / "jobs" / "a" / "5"
+
+
+def test_launch_never_resubmits_a_live_array_the_ledger_missed(tmp_path):
+    """An interrupted launch can leave jobid.txt naming a job the ledger lacks."""
+    chains = [_chain(tmp_path, "orphan", 10), _chain(tmp_path, "free", 10)]
+    (tmp_path / "orphan" / "jobid.txt").write_text("555_3")
+    camp, sub = _launch_campaign(tmp_path, chains, executor="slurm")
+    states = {"555_3": {"status": "PENDING"}}
+    with patch("py_alf.campaign.campaign.job_states", return_value=states):
+        camp.launch(verbose=False)
+
+    assert [s.sim_dir for s in sub.calls[0]["sims"]] == [chains[1].sim_dir]
+    segs = Ledger.load(tmp_path / "c.json").chains["orphan"]["segments"]
+    assert segs == [{"job_id": "555_3", "recovered": True}]
+
+
+def test_status_unstarted_when_every_job_was_cancelled_before_running(tmp_path):
+    """Stopping a queue of pending tasks is no crash; such chains must be resubmitted."""
+    got = _status_with(tmp_path, 0, [{"job_id": "1_0"}], "CANCELLED")
+    assert got.verdict == "unstarted"
+
+
+def test_status_suspect_when_a_cancelled_job_had_run(tmp_path):
+    """A worker record means ALF ran and produced nothing: still a crash signature."""
+    got = _status_with(tmp_path, 0, [{"job_id": "1_0", "bins_after": 0}], "CANCELLED")
+    assert got.verdict == "suspect"
+
+
+# --- worker: run_pack and the pack deadline ----------------------------------
+
+
+class _WorkerSim:
+    """Just enough Simulation for run_chain; ALF is patched to add bins."""
+
+    def __init__(self, sim_dir, bins=0, target=10, hours_per_bin=0.01, fail=False):
+        self.sim_dir = str(sim_dir)
+        Path(sim_dir).mkdir(parents=True, exist_ok=True)
+        self.bins = bins
+        self.fail = fail
+        self.sim_dict = {}
+        self.alf_src = SimpleNamespace(commit=lambda: "abc")
+        self.segment_plan = SimpleNamespace(
+            target_bins=target,
+            hours_per_bin=hours_per_bin,
+            partition_rules={},
+            policy=SegmentPolicy(),
+            cpu_max_ceiling=2.0,
+            chain_id=Path(sim_dir).name,
+            counting_obs="Ener_scal",
+        )
+
+    def bin_count(self, _obs):
+        return self.bins
+
+    def run(self, only_prep):
+        assert only_prep
+
+
+def _fake_alf(sim):
+    if sim.fail:
+        raise subprocess.CalledProcessError(1, "ALF.out")
+    sim.bins = sim.segment_plan.target_bins
+
+
+def test_run_pack_runs_every_chain_in_turn(tmp_path):
+    from py_alf.campaign.worker import run_pack
+
+    sims = [_WorkerSim(tmp_path / n) for n in ("a", "b", "c")]
+    with patch("py_alf.campaign.worker.exec_alf_binary", side_effect=_fake_alf):
+        run_pack(sims, 1.0)
+    assert [s.bins for s in sims] == [10, 10, 10]
+    assert all(s.sim_dict["CPU_MAX"] <= 1.0 for s in sims)
+    assert all(list((Path(s.sim_dir) / "segments").glob("*.json")) for s in sims)
+
+
+def test_run_pack_carries_on_past_a_failed_chain_then_fails(tmp_path):
+    from py_alf.campaign.worker import run_pack
+
+    sims = [
+        _WorkerSim(tmp_path / "a"),
+        _WorkerSim(tmp_path / "bad", fail=True),
+        _WorkerSim(tmp_path / "c"),
+    ]
+    with (
+        patch("py_alf.campaign.worker.exec_alf_binary", side_effect=_fake_alf),
+        pytest.raises(RuntimeError, match="1 of 3 chains failed: bad"),
+    ):
+        run_pack(sims, 1.0)
+    assert [s.bins for s in sims] == [10, 0, 10]
+
+
+def test_run_chain_defers_a_chain_the_pack_has_no_time_for(tmp_path):
+    """Fewer than 1.5 bins left before the deadline: ALF is not started."""
+    import time
+
+    from py_alf.campaign.worker import run_chain
+
+    sim = _WorkerSim(tmp_path / "a", hours_per_bin=1.0)
+    with patch("py_alf.campaign.worker.exec_alf_binary", side_effect=_fake_alf) as alf:
+        run_chain(sim, deadline=time.time() + 3600)  # 1 h left, 1.5 h needed
+    alf.assert_not_called()
+    assert sim.bins == 0
+
+
+def test_run_chain_caps_cpu_max_at_the_time_left(tmp_path):
+    import time
+
+    from py_alf.campaign.worker import run_chain
+
+    sim = _WorkerSim(tmp_path / "a", hours_per_bin=0.1)  # wants 10 * 0.1 * 1.3 h
+    with patch("py_alf.campaign.worker.exec_alf_binary", side_effect=_fake_alf):
+        run_chain(sim, deadline=time.time() + 0.5 * 3600)
+    assert sim.sim_dict["CPU_MAX"] == pytest.approx(0.5, abs=1e-3)
+
+
+def test_run_pack_is_checkpointable(tmp_path):
+    from py_alf.campaign.worker import run_pack
+
+    resumed = run_pack.checkpoint([_sim(tmp_path)], 2.0)
+    assert isinstance(resumed, submitit.helpers.DelayedSubmission)
+    assert resumed.function is run_pack
+    assert resumed.args[1] == 2.0
+
+
+def test_the_pack_budget_never_outgrows_the_partition():
+    """48 h packs on a 48 h queue would leave ALF no time to stop: cap at the margin."""
+    policy = SegmentPolicy(pack_hours=48.0)
+    assert policy.pack_budget(RULES) == pytest.approx(48 * 0.95)
+    assert SegmentPolicy(pack_hours=2.0).pack_budget(RULES) == 2.0
+    assert policy.pack_budget({}) == 48.0  # no queue to fit off SLURM
+
+
+def test_a_pack_request_is_clamped_to_the_partition(tmp_path):
+    """One chain just under the budget plus its overhead must not overflow medium."""
+    camp, sub = _pack_launch(tmp_path, {"big": (0, "a")}, pack_hours=100.0)
+    camp.submitter.partition_rules = {"medium": 12.0}
+    camp.launch(verbose=False)  # 100 bins at 0.1 h: 10 h + overhead, alone
+    (call,) = sub.calls
+    assert call["hours"] <= 12.0 * 0.95

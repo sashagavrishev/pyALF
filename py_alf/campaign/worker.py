@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -98,14 +99,52 @@ def measured_hours_per_bin(sim_dir: str | Path) -> float | None:
     return best[1] if best else None
 
 
-def run_segment(sim) -> None:
-    """Run one checkpoint-restart segment of ``sim``'s Markov chain."""
-    plan: SegmentPlan = sim.segment_plan
-    sim_dir = Path(sim.sim_dir)
-    job_id = (
+def _job_id() -> str:
+    """This task's id: ``<array>_<task>`` under a SLURM array."""
+    return (
         os.environ.get("SLURM_ARRAY_JOB_ID")
         and f"{os.environ['SLURM_ARRAY_JOB_ID']}_{os.environ.get('SLURM_ARRAY_TASK_ID', '0')}"
     ) or os.environ.get("SLURM_JOB_ID", f"local-{os.getpid()}")
+
+
+def run_segment(sim) -> None:
+    """Run one checkpoint-restart segment of ``sim``'s Markov chain.
+
+    Pickled by every array submitted before packing, so its name and signature stay.
+    """
+    run_chain(sim)
+
+
+def run_pack(sims, hours: float) -> None:
+    """Run each chain of a pack in turn, within ``hours`` of this task's start.
+
+    A chain that fails is reported and skipped so the rest still run; the task
+    then fails, while every chain's bins stay where its own segment left them.
+    """
+    deadline = time.time() + hours * 3600
+    failed = []
+    for sim in sims:
+        try:
+            run_chain(sim, deadline)
+        except Exception:
+            print(f"[pack] {Path(sim.sim_dir).name} failed:\n{traceback.format_exc()}")
+            failed.append(Path(sim.sim_dir).name)
+    if failed:
+        raise RuntimeError(
+            f"{len(failed)} of {len(sims)} chains failed: {', '.join(failed)}"
+        )
+
+
+def run_chain(sim, deadline: float | None = None) -> None:
+    """Run one segment of ``sim``'s chain, ending by ``deadline`` (epoch seconds).
+
+    Without a deadline the segment's ``CPU_MAX`` alone bounds it. With one, a
+    chain without time for 1.5 more bins, which ALF needs to stop cleanly, is
+    left for the requeue or the next reconcile.
+    """
+    plan: SegmentPlan = sim.segment_plan
+    sim_dir = Path(sim.sim_dir)
+    job_id = _job_id()
 
     if _clear_own_running(sim_dir, job_id):
         print(
@@ -126,6 +165,15 @@ def run_segment(sim) -> None:
     cpu_max = plan.policy.cpu_max(remaining, hours_per_bin, plan.partition_rules)
     if plan.cpu_max_ceiling:
         cpu_max = min(cpu_max, plan.cpu_max_ceiling)
+    if deadline is not None:
+        left = (deadline - time.time()) / 3600
+        if left < 1.5 * hours_per_bin:
+            print(
+                f"[segment] {sim_dir.name}: {left * 60:.1f} min left in the pack, "
+                f"under 1.5 bins at {hours_per_bin * 60:.2f} min/bin; deferred."
+            )
+            return
+        cpu_max = min(cpu_max, left)
 
     # ALF stops at whichever comes first: CPU_MAX inside the allocation, or
     # NBin = remaining exactly at the target (each run appends from bin 1).
@@ -183,6 +231,12 @@ def _checkpoint_segment(sim) -> submitit.helpers.DelayedSubmission:
     return submitit.helpers.DelayedSubmission(run_segment, sim)
 
 
+def _checkpoint_pack(sims, hours: float) -> submitit.helpers.DelayedSubmission:
+    """Requeue the whole pack: finished chains return at once, the rest resume."""
+    return submitit.helpers.DelayedSubmission(run_pack, sims, hours)
+
+
 # submitit looks this attribute up on the submitted function itself, so it has
 # to exist after a plain import on the node.
 run_segment.checkpoint = _checkpoint_segment
+run_pack.checkpoint = _checkpoint_pack

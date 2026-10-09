@@ -157,10 +157,12 @@ class ClusterSubmitter:
         and write its output after stopping, capped at the limit of the
         partition ``CPU_MAX`` fits.
         """
-        slurm = self.executor == "slurm"
         sim_dict = sim.sim_dict[0] if isinstance(sim.sim_dict, list) else sim.sim_dict
-        cpu_max = float(sim_dict.get("CPU_MAX", 0))
-        if not slurm:
+        return self._wall_time_for(float(sim_dict.get("CPU_MAX", 0)))
+
+    def _wall_time_for(self, cpu_max: float) -> tuple[int, str | None]:
+        """``(minutes, partition)`` for a run budget of *cpu_max* hours."""
+        if self.executor != "slurm":
             return int(max(cpu_max, 0.0) * 60), None
         if cpu_max <= 0:
             raise ValueError(
@@ -240,7 +242,6 @@ class ClusterSubmitter:
             One Job object per submitted simulation.
         """
 
-        _SIM_ATTRS = ("sim_dir", "sim_dict", "ham_name", "n_omp", "n_mpi", "mpi", "run")
         if (
             isinstance(sims, Iterable)
             and not isinstance(sims, (str, bytes))
@@ -249,13 +250,7 @@ class ClusterSubmitter:
             sim_list = list(sims)
         else:
             sim_list = [sims]
-
-        for s in sim_list:
-            missing = [a for a in _SIM_ATTRS if not hasattr(s, a)]
-            if missing:
-                raise TypeError(
-                    f"Expected Simulation-like object (missing {missing!r}), got {type(s)}"
-                )
+        _check_sims(sim_list)
 
         active = (
             self._active_jobs(sim_list)
@@ -268,40 +263,86 @@ class ClusterSubmitter:
             if s.sim_dir in active:
                 logger.info(f"Skipping {s.sim_dir}: job {active[s.sim_dir]} is active")
                 continue
-
-            running_file = Path(s.sim_dir) / "RUNNING"
-            if running_file.exists():
-                if stale_running == "remove":
-                    running_file.unlink()
-                    logger.warning(f"Removed a leftover RUNNING file in {s.sim_dir}.")
-                else:
-                    logger.warning(
-                        f"Skipping {s.sim_dir}: leftover RUNNING file from a "
-                        "previous run (pass stale_running='remove' to clear it)."
-                    )
-                    continue
-
-            filtered_sims.append(s)
+            if _clear_stale_running(s, stale_running):
+                filtered_sims.append(s)
 
         if not filtered_sims:
             logger.info("No inactive simulations to submit.")
             return []
 
         sim = filtered_sims[0]
-
-        # One array shares one set of SLURM parameters.
-        if len(filtered_sims) > 1:
-            for s in filtered_sims[1:]:
-                if s.n_omp != sim.n_omp or s.n_mpi != sim.n_mpi or s.mpi != sim.mpi:
-                    raise ValueError(
-                        "All simulations in an array job must have the same n_omp, n_mpi, "
-                        f"and mpi settings (derived from filtered_sims[0]: n_omp={sim.n_omp}, "
-                        f"n_mpi={sim.n_mpi}, mpi={sim.mpi}), but {s.sim_dir} has "
-                        f"n_omp={s.n_omp}, n_mpi={s.n_mpi}, mpi={s.mpi}."
-                    )
-
+        _check_uniform(filtered_sims)
         timeout_min, partition = self._wall_time(sim)
+        executor = self._executor(
+            sim, timeout_min, partition, job_properties, submit_dir, max_requeues
+        )
 
+        for s in filtered_sims:
+            _stage(s, prep)
+
+        run_fn = runner if runner is not None else exec_alf_binary
+        if len(filtered_sims) == 1:
+            jobs = [executor.submit(run_fn, filtered_sims[0])]
+        else:
+            jobs = executor.map_array(run_fn, filtered_sims)
+
+        # jobid.txt is how a later submit recognises a chain that is still active.
+        for s, job in zip(filtered_sims, jobs):
+            Path(s.sim_dir, "jobid.txt").write_text(job.job_id)
+
+        logger.info(f"Submitted {len(jobs)} job(s): {[j.job_id for j in jobs]}")
+        return jobs
+
+    def submit_packs(
+        self,
+        packs: list[list[Simulation]],
+        hours: float,
+        runner: Callable[[list[Simulation], float], None],
+        job_properties: dict[str, Any] | None = None,
+        submit_dir: str | Path | None = None,
+        max_requeues: int | None = None,
+    ) -> list[submitit.Job]:
+        """Submit one array whose task ``i`` calls ``runner(packs[i], hours)``.
+
+        Each task runs its pack's simulations in turn on one slot, within
+        ``hours`` plus the 10% :meth:`submit` also allows. Directories are
+        staged as ``submit(prep=False)`` does, a leftover ``RUNNING`` is
+        removed, and every simulation's ``jobid.txt`` names its pack's job. The
+        caller must already have left out simulations with an active job.
+        """
+        packs = [list(p) for p in packs if p]
+        if not packs:
+            return []
+        sims = [s for p in packs for s in p]
+        _check_sims(sims)
+        _check_uniform(sims)
+        for s in sims:
+            _clear_stale_running(s, "remove")
+            _stage(s, prep=False)
+
+        timeout_min, partition = self._wall_time_for(hours)
+        executor = self._executor(
+            sims[0], timeout_min, partition, job_properties, submit_dir, max_requeues
+        )
+        jobs = executor.map_array(runner, packs, [hours] * len(packs))
+
+        for pack, job in zip(packs, jobs, strict=True):
+            for s in pack:
+                Path(s.sim_dir, "jobid.txt").write_text(job.job_id)
+
+        logger.info(f"Submitted {len(jobs)} pack(s) of {len(sims)} simulations.")
+        return jobs
+
+    def _executor(
+        self,
+        sim: Simulation,
+        timeout_min: int,
+        partition: str | None,
+        job_properties: dict[str, Any] | None,
+        submit_dir: str | Path | None,
+        max_requeues: int | None,
+    ) -> submitit.AutoExecutor:
+        """A submitit executor configured for an array shaped like *sim*."""
         # Defaults, then the instance's options, then this call's. Each MPI rank
         # is a task slot of n_omp cores, matching mpiexec -n n_mpi with
         # OMP_NUM_THREADS=n_omp.
@@ -323,15 +364,6 @@ class ClusterSubmitter:
         params.update(self.executor_params)
         params.update(job_properties or {})
 
-        for s in filtered_sims:
-            if prep:
-                s.run(only_prep=True, copy_bin=True)
-            else:
-                Path(s.sim_dir).mkdir(parents=True, exist_ok=True)
-                shutil.copy(
-                    os.path.join(s.alf_src.alf_dir, "Prog", "ALF.out"), s.sim_dir
-                )
-
         effective_submit_dir = (
             Path(submit_dir) if submit_dir is not None else self.submit_dir
         )
@@ -351,16 +383,54 @@ class ClusterSubmitter:
             **executor_kwargs,
         )
         executor.update_parameters(**params)
+        return executor
 
-        run_fn = runner if runner is not None else exec_alf_binary
-        if len(filtered_sims) == 1:
-            jobs = [executor.submit(run_fn, filtered_sims[0])]
-        else:
-            jobs = executor.map_array(run_fn, filtered_sims)
 
-        # jobid.txt is how a later submit recognises a chain that is still active.
-        for s, job in zip(filtered_sims, jobs):
-            Path(s.sim_dir, "jobid.txt").write_text(job.job_id)
+_SIM_ATTRS = ("sim_dir", "sim_dict", "ham_name", "n_omp", "n_mpi", "mpi", "run")
 
-        logger.info(f"Submitted {len(jobs)} job(s): {[j.job_id for j in jobs]}")
-        return jobs
+
+def _check_sims(sims: list) -> None:
+    for s in sims:
+        missing = [a for a in _SIM_ATTRS if not hasattr(s, a)]
+        if missing:
+            raise TypeError(
+                f"Expected Simulation-like object (missing {missing!r}), got {type(s)}"
+            )
+
+
+def _check_uniform(sims: list[Simulation]) -> None:
+    """One array shares one set of SLURM parameters."""
+    sim = sims[0]
+    for s in sims[1:]:
+        if s.n_omp != sim.n_omp or s.n_mpi != sim.n_mpi or s.mpi != sim.mpi:
+            raise ValueError(
+                "All simulations in an array job must have the same n_omp, n_mpi, "
+                f"and mpi settings (derived from the first: n_omp={sim.n_omp}, "
+                f"n_mpi={sim.n_mpi}, mpi={sim.mpi}), but {s.sim_dir} has "
+                f"n_omp={s.n_omp}, n_mpi={s.n_mpi}, mpi={s.mpi}."
+            )
+
+
+def _clear_stale_running(sim: Simulation, stale_running: str) -> bool:
+    """Handle a leftover ``RUNNING``; False if *sim* must be left out."""
+    running_file = Path(sim.sim_dir) / "RUNNING"
+    if not running_file.exists():
+        return True
+    if stale_running == "remove":
+        running_file.unlink()
+        logger.warning(f"Removed a leftover RUNNING file in {sim.sim_dir}.")
+        return True
+    logger.warning(
+        f"Skipping {sim.sim_dir}: leftover RUNNING file from a "
+        "previous run (pass stale_running='remove' to clear it)."
+    )
+    return False
+
+
+def _stage(sim: Simulation, prep: bool) -> None:
+    """Prepare *sim*'s directory now, or only copy the binary for a node-side prep."""
+    if prep:
+        sim.run(only_prep=True, copy_bin=True)
+    else:
+        Path(sim.sim_dir).mkdir(parents=True, exist_ok=True)
+        shutil.copy(os.path.join(sim.alf_src.alf_dir, "Prog", "ALF.out"), sim.sim_dir)

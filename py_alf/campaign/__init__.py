@@ -8,8 +8,12 @@ Public surface::
 
 A caller builds one :class:`Chain` per Simulation (:meth:`Chain.from_sim`), wraps
 them in a :class:`Campaign` with a configured ``ClusterSubmitter``, and calls
-``launch()``, which submits one SLURM array per ``array_key``. Three layers then
-carry each chain to its target:
+``launch()``, which submits one SLURM array per ``array_key``. With
+``SegmentPolicy.pack_hours`` set, chains expected to finish within it are packed
+instead (:mod:`~py_alf.campaign.packing`): each task runs a few in turn
+(:func:`~py_alf.campaign.worker.run_pack`), every chain keeping its own
+directory, ledger record and segment records. Three layers then carry each chain
+to its target:
 
 1. ``CPU_MAX`` (:mod:`~py_alf.campaign.policy`): ALF stops at a bin boundary
    inside the partition limit, with ``data.h5`` and its checkpoint flushed;

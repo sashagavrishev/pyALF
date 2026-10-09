@@ -31,6 +31,22 @@ class SegmentPolicy:
     # Floor on a segment's budget: make_truncation needs a few bins to measure,
     # and a shorter run is dwarfed by its queue wait.
     min_hours: float = 0.25
+    # Chains expected to need less than this share a task, run one after another
+    # up to this budget; 0 gives every chain a task of its own.
+    pack_hours: float = 0.0
+    # Charged per packed chain for prep, ALF start-up and opening data.h5.
+    pack_overhead_hours: float = 1 / 60
+    # Tasks per SLURM array, below the cluster's MaxArraySize.
+    max_array_tasks: int = 1000
+
+    def pack_budget(self, partition_rules: dict) -> float:
+        """Hours a pack may fill: ``pack_hours``, but never past :meth:`max_hours`,
+        or the task's request would outgrow the partition."""
+        return min(self.pack_hours, self.max_hours(partition_rules))
+
+    def chain_hours(self, remaining_bins: int, hours_per_bin: float) -> float:
+        """Expected hours to finish a chain, with the safety factor."""
+        return remaining_bins * hours_per_bin * self.safety
 
     def max_hours(self, partition_rules: dict) -> float:
         """Largest ``CPU_MAX`` any segment may ask for, in hours.
