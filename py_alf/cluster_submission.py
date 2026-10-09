@@ -6,6 +6,7 @@ __author__ = "Johannes Hofmann"
 __copyright__ = "Copyright 2020-2025, The ALF Project"
 __license__ = "GPL"
 
+import hashlib
 import logging
 import os
 import shutil
@@ -428,9 +429,53 @@ def _clear_stale_running(sim: Simulation, stale_running: str) -> bool:
 
 
 def _stage(sim: Simulation, prep: bool) -> None:
-    """Prepare *sim*'s directory now, or only copy the binary for a node-side prep."""
+    """Prepare *sim*'s directory now, or only place the binary for a node-side prep."""
     if prep:
         sim.run(only_prep=True, copy_bin=True)
     else:
         Path(sim.sim_dir).mkdir(parents=True, exist_ok=True)
-        shutil.copy(os.path.join(sim.alf_src.alf_dir, "Prog", "ALF.out"), sim.sim_dir)
+        _place_binary(Path(sim.alf_src.alf_dir, "Prog", "ALF.out"), Path(sim.sim_dir))
+
+
+BINARY_DIR = ".alf_bin"
+
+
+def _frozen_binary(src: Path, root: Path) -> Path:
+    """One read-only copy of *src* under *root*, named by its content.
+
+    A rebuild gets a new name, so a queued chain keeps the binary it was staged
+    with, as a copy per directory guaranteed.
+    """
+    stat = src.stat()
+    key = (str(src), stat.st_mtime_ns, stat.st_size, str(root))
+    if key not in _FROZEN:
+        digest = hashlib.sha256(src.read_bytes()).hexdigest()[:16]
+        frozen = root / BINARY_DIR / f"ALF-{digest}.out"
+        if not frozen.exists():
+            frozen.parent.mkdir(parents=True, exist_ok=True)
+            tmp = frozen.with_suffix(f".tmp{os.getpid()}")
+            shutil.copy2(src, tmp)
+            tmp.chmod(0o555)
+            os.replace(tmp, frozen)
+        _FROZEN[key] = frozen
+    return _FROZEN[key]
+
+
+_FROZEN: dict[tuple, Path] = {}
+
+
+def _place_binary(src: Path, sim_dir: Path) -> None:
+    """Hard-link the frozen binary as ``sim_dir/ALF.out``; copy across filesystems.
+
+    Copying a multi-megabyte binary into every directory dominated submitting
+    a grid of hundreds of thousands of chains; a link costs one metadata write.
+    """
+    dest = sim_dir / "ALF.out"
+    frozen = _frozen_binary(src, sim_dir.parent)
+    if dest.exists() and dest.samefile(frozen):
+        return
+    dest.unlink(missing_ok=True)
+    try:
+        os.link(frozen, dest)
+    except OSError:
+        shutil.copy(src, dest)

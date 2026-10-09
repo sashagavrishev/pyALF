@@ -734,3 +734,72 @@ def test_submit_packs_runs_a_pack_locally(tmp_path):
     (job,) = cs.submit_packs([sims], 0.1, runner=print)
     assert job.result() is None
     assert "a" in Path(job.paths.stdout).read_text()
+
+
+# --- the binary: one frozen copy, hard-linked into each directory ---
+
+
+def _binary_src(tmp_path: Path, content: bytes = b"alf-v1") -> Path:
+    src = tmp_path / "ALF" / "Prog" / "ALF.out"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(content)
+    return src
+
+
+def test_every_directory_shares_one_frozen_binary(tmp_path):
+    from py_alf.cluster_submission import BINARY_DIR, _place_binary
+
+    src = _binary_src(tmp_path)
+    dirs = [tmp_path / "root" / name for name in ("a", "b")]
+    for d in dirs:
+        d.mkdir(parents=True)
+        _place_binary(src, d)
+
+    a, b = (d / "ALF.out" for d in dirs)
+    assert a.samefile(b)
+    assert a.read_bytes() == b"alf-v1"
+    (frozen,) = (tmp_path / "root" / BINARY_DIR).iterdir()
+    assert a.samefile(frozen)
+
+
+def test_a_rebuild_never_changes_a_staged_binary(tmp_path):
+    """A queued chain keeps the build it was staged with, as a copy did."""
+    import os
+
+    from py_alf.cluster_submission import _place_binary
+
+    src = _binary_src(tmp_path)
+    old = tmp_path / "root" / "old"
+    old.mkdir(parents=True)
+    _place_binary(src, old)
+
+    src.write_bytes(b"alf-v2")
+    os.utime(src, ns=(1, 1))  # a new build is a new mtime
+    new = tmp_path / "root" / "new"
+    new.mkdir()
+    _place_binary(src, new)
+
+    assert (old / "ALF.out").read_bytes() == b"alf-v1"
+    assert (new / "ALF.out").read_bytes() == b"alf-v2"
+
+
+def test_restaging_replaces_an_old_copy_with_the_link(tmp_path):
+    from py_alf.cluster_submission import _place_binary
+
+    src = _binary_src(tmp_path)
+    d = tmp_path / "root" / "a"
+    d.mkdir(parents=True)
+    (d / "ALF.out").write_bytes(b"stale")
+    _place_binary(src, d)
+    assert (d / "ALF.out").read_bytes() == b"alf-v1"
+
+
+def test_the_binary_is_copied_where_it_cannot_be_linked(tmp_path):
+    from py_alf.cluster_submission import _place_binary
+
+    src = _binary_src(tmp_path)
+    d = tmp_path / "root" / "a"
+    d.mkdir(parents=True)
+    with patch("py_alf.cluster_submission.os.link", side_effect=OSError("EXDEV")):
+        _place_binary(src, d)
+    assert (d / "ALF.out").read_bytes() == b"alf-v1"

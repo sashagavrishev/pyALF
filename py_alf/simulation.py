@@ -240,8 +240,13 @@ class Simulation:
 
         executable = os.path.join(self.alf_src.alf_dir, "Prog", "ALF.out")
         if copy_bin:
-            shutil.copy(executable, self.sim_dir)
-            executable = os.path.join(self.sim_dir, "ALF.out")
+            # Unlinked first: it may be a hard link to a frozen binary other
+            # directories share, which copying over it would rewrite.
+            local = os.path.join(self.sim_dir, "ALF.out")
+            if os.path.lexists(local):
+                os.unlink(local)
+            shutil.copy(executable, local)
+            executable = local
         if bin_in_sim_dir:
             executable = os.path.join(self.sim_dir, "ALF.out")
         if only_prep:
